@@ -1,0 +1,683 @@
+import * as vscode from 'vscode';
+import JSZip from 'jszip';
+import { HwpxParser } from './hwpxParser';
+
+export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
+
+    public static register(context: vscode.ExtensionContext): vscode.Disposable {
+        const provider = new HwpxEditorProvider(context);
+        const providerRegistration = vscode.window.registerCustomEditorProvider(HwpxEditorProvider.viewType, provider, {
+            webviewOptions: {
+                retainContextWhenHidden: true,
+            }
+        });
+        return providerRegistration;
+    }
+
+    private static readonly viewType = 'hwpx.preview';
+
+    constructor(
+        private readonly context: vscode.ExtensionContext
+    ) { }
+
+    async openCustomDocument(
+        uri: vscode.Uri,
+        openContext: vscode.CustomDocumentOpenContext,
+        token: vscode.CancellationToken
+    ): Promise<vscode.CustomDocument> {
+        return {
+            uri,
+            dispose: () => { }
+        };
+    }
+
+    async resolveCustomEditor(
+        document: vscode.CustomDocument,
+        webviewPanel: vscode.WebviewPanel,
+        token: vscode.CancellationToken
+    ): Promise<void> {
+
+        // Setup initial content for the webview
+        webviewPanel.webview.options = {
+            enableScripts: true,
+        };
+        webviewPanel.webview.html = this.getLoadingHtml();
+
+        try {
+            // Read the file data
+            const fileData = await vscode.workspace.fs.readFile(document.uri);
+            const zip = await JSZip.loadAsync(fileData);
+
+            // Minimal checks & passing to extension logic
+            const mimetype = await zip.file('mimetype')?.async('string');
+            if (!mimetype || !mimetype.includes('application/hwp+zip')) {
+                throw new Error('이 파일은 유효한 HWPX 확장자가 아닌 것 같습니다.');
+            }
+
+            // Phase 2: 실제 HWPX 파일의 텍스트와 메타데이터 추출
+            const parseResult = await HwpxParser.parse(zip);
+
+            let headerHtml = '<h2>문서 뷰어 (Phase 2 Preview)</h2><div style="margin-bottom: 20px;">';
+            if (parseResult.metadata.title) {
+                headerHtml += `<p><strong>문서 제목:</strong> ${parseResult.metadata.title}</p>`;
+            }
+            if (parseResult.metadata.creator) {
+                headerHtml += `<p><strong>작성자:</strong> ${parseResult.metadata.creator}</p>`;
+            }
+            headerHtml += '</div>';
+
+            const bodyHtml = `
+                <style>
+                    html, body {
+                        margin: 0; padding: 0;
+                        width: 100%; height: 100%;
+                        overflow: hidden;
+                        background-color: #e5e5e5;
+                    }
+                    #hwpx-scroll-container {
+                        width: 100%; height: 100%;
+                        overflow: auto;
+                        cursor: grab;
+                        background-color: #e5e5e5;
+                    }
+                    #hwpx-scroll-container.dragging {
+                        cursor: grabbing;
+                        user-select: none;
+                    }
+                    #hwpx-zoom-wrapper {
+                        color: #000;
+                        padding: 40px 50vw 100vh 50vw;
+                        font-family: 'Malgun Gothic', 'Dotum', sans-serif;
+                        line-height: 1.6;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        min-height: 100%;
+                        box-sizing: border-box;
+                        transform-origin: top center;
+                    }
+                    .hwpx-page {
+                        flex-shrink: 0 !important;
+                        margin-bottom: 30px;
+                        box-shadow: 0 2px 10px rgba(0,0,0,0.2) !important;
+                        background-color: white;
+                    }
+                    /* 모드 토글 바 */
+                    #hwpx-mode-bar {
+                        position: fixed;
+                        top: 12px;
+                        right: 16px;
+                        z-index: 9999;
+                        display: flex;
+                        border-radius: 6px;
+                        overflow: hidden;
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+                        font-family: system-ui, sans-serif;
+                        font-size: 13px;
+                        user-select: none;
+                    }
+                    #hwpx-mode-bar button {
+                        border: none;
+                        padding: 6px 16px;
+                        cursor: pointer;
+                        color: #ccc;
+                        background: rgba(30,30,30,0.85);
+                        transition: background 0.15s, color 0.15s;
+                    }
+                    #hwpx-mode-bar button:hover {
+                        background: rgba(60,60,60,0.9);
+                    }
+                    #hwpx-mode-bar button.active {
+                        background: #0078d4;
+                        color: #fff;
+                    }
+                    /* Edit 모드 */
+                    #hwpx-scroll-container.edit-mode {
+                        cursor: text;
+                    }
+                    #hwpx-scroll-container.edit-mode .hwpx-page [contenteditable="true"]:focus {
+                        outline: 2px solid #0078d4;
+                        outline-offset: 1px;
+                    }
+                    /* Select 모드 */
+                    #hwpx-scroll-container.select-mode {
+                        cursor: crosshair;
+                    }
+                    #hwpx-scroll-container.select-mode .hwpx-page * {
+                        cursor: crosshair;
+                    }
+                    #hwpx-scroll-container.select-mode .hwpx-page *:hover {
+                        outline: 2px dashed #0078d4;
+                        outline-offset: 1px;
+                    }
+                    #hwpx-toast {
+                        position: fixed;
+                        top: 50px;
+                        left: 50%;
+                        transform: translateX(-50%) translateY(-10px);
+                        background: rgba(0,120,212,0.92);
+                        color: #fff;
+                        padding: 8px 20px;
+                        border-radius: 6px;
+                        font-family: system-ui, sans-serif;
+                        font-size: 13px;
+                        z-index: 10000;
+                        opacity: 0;
+                        pointer-events: none;
+                        transition: opacity 0.2s, transform 0.2s;
+                        box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+                        white-space: nowrap;
+                    }
+                    #hwpx-toast.show {
+                        opacity: 1;
+                        transform: translateX(-50%) translateY(0);
+                    }
+                    /* 텍스트 도구 상자 */
+                    #hwpx-toolbar {
+                        position: fixed;
+                        top: 12px;
+                        left: 50%;
+                        transform: translateX(-50%);
+                        z-index: 9999;
+                        display: none;
+                        align-items: center;
+                        gap: 2px;
+                        background: rgba(30,30,30,0.92);
+                        padding: 4px 8px;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+                        font-family: system-ui, sans-serif;
+                        font-size: 13px;
+                        user-select: none;
+                    }
+                    #hwpx-toolbar.visible { display: flex; }
+                    #hwpx-toolbar .tb-sep {
+                        width: 1px; height: 22px;
+                        background: rgba(255,255,255,0.15);
+                        margin: 0 4px;
+                    }
+                    #hwpx-toolbar button {
+                        background: transparent;
+                        border: none;
+                        color: #ddd;
+                        width: 28px; height: 28px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 14px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        padding: 0;
+                    }
+                    #hwpx-toolbar button:hover { background: rgba(255,255,255,0.15); }
+                    #hwpx-toolbar button.active { background: rgba(255,255,255,0.25); color: #fff; }
+                    #hwpx-toolbar select, #hwpx-toolbar input[type="number"] {
+                        background: rgba(255,255,255,0.12);
+                        border: 1px solid rgba(255,255,255,0.2);
+                        color: #eee;
+                        border-radius: 4px;
+                        padding: 2px 4px;
+                        font-size: 12px;
+                        height: 26px;
+                        cursor: pointer;
+                    }
+                    #hwpx-toolbar input[type="number"] { width: 44px; text-align: center; }
+                    #hwpx-toolbar input[type="color"] {
+                        width: 22px; height: 22px;
+                        border: none; padding: 0;
+                        background: transparent;
+                        cursor: pointer;
+                    }
+                    #hwpx-toolbar .tb-color-wrap {
+                        display: flex; align-items: center; gap: 2px;
+                        padding: 0 2px;
+                    }
+                    #hwpx-toolbar .tb-color-label {
+                        color: #aaa; font-size: 11px;
+                    }
+                    #hwpx-zoom-indicator {
+                        position: fixed;
+                        bottom: 16px;
+                        right: 16px;
+                        background: rgba(30,30,30,0.85);
+                        color: #fff;
+                        padding: 6px 14px;
+                        border-radius: 6px;
+                        font-size: 13px;
+                        font-family: system-ui, sans-serif;
+                        z-index: 9999;
+                        user-select: none;
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+                    }
+                    #hwpx-zoom-indicator button {
+                        background: rgba(255,255,255,0.15);
+                        border: none;
+                        color: #fff;
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 16px;
+                        line-height: 1;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                    }
+                    #hwpx-zoom-indicator button:hover {
+                        background: rgba(255,255,255,0.3);
+                    }
+                    #hwpx-zoom-level {
+                        min-width: 40px;
+                        text-align: center;
+                        cursor: pointer;
+                    }
+                    #hwpx-zoom-level:hover {
+                        text-decoration: underline;
+                    }
+                    ${parseResult.css}
+                </style>
+                <div id="hwpx-scroll-container" data-doc-uri="${document.uri.fsPath.replace(/\\/g, '/').replace(/'/g, "\\'")}">
+                    <div id="hwpx-zoom-wrapper">
+                        ${parseResult.html}
+                    </div>
+                </div>
+                <div id="hwpx-mode-bar">
+                    <button id="hwpx-mode-view" class="active" title="보기 모드">View</button>
+                    <button id="hwpx-mode-edit" title="편집 모드">Edit</button>
+                    <button id="hwpx-mode-select" title="요소 선택 모드">Select</button>
+                </div>
+                <div id="hwpx-toast"></div>
+                <div id="hwpx-toolbar">
+                    <button id="tb-bold" title="굵게 (Ctrl+B)"><b>B</b></button>
+                    <button id="tb-italic" title="기울임 (Ctrl+I)"><i>I</i></button>
+                    <button id="tb-underline" title="밑줄 (Ctrl+U)" style="text-decoration:underline;">U</button>
+                    <button id="tb-strike" title="취소선"><s>S</s></button>
+                    <div class="tb-sep"></div>
+                    <input type="number" id="tb-fontsize" title="글꼴 크기 (pt)" min="6" max="200" value="12" step="1">
+                    <div class="tb-sep"></div>
+                    <div class="tb-color-wrap">
+                        <span class="tb-color-label">A</span>
+                        <input type="color" id="tb-forecolor" title="글자 색상" value="#000000">
+                    </div>
+                    <div class="tb-color-wrap">
+                        <span class="tb-color-label" style="background:#ff0;color:#333;padding:0 2px;border-radius:2px;">A</span>
+                        <input type="color" id="tb-backcolor" title="배경 색상" value="#ffff00">
+                    </div>
+                    <div class="tb-sep"></div>
+                    <button id="tb-align-left" title="왼쪽 정렬" style="font-size:11px;">&#9776;</button>
+                    <button id="tb-align-center" title="가운데 정렬" style="font-size:11px;">&#9776;</button>
+                    <button id="tb-align-right" title="오른쪽 정렬" style="font-size:11px;">&#9776;</button>
+                    <button id="tb-align-justify" title="양쪽 정렬" style="font-size:11px;">&#9776;</button>
+                    <div class="tb-sep"></div>
+                    <button id="tb-remove-format" title="서식 제거" style="font-size:12px;">T<span style="font-size:9px;">x</span></button>
+                </div>
+                <style>
+                    #tb-align-left { font-size: 0 !important; width: 28px; height: 28px; position: relative; }
+                    #tb-align-center, #tb-align-right, #tb-align-justify { font-size: 0 !important; width: 28px; height: 28px; position: relative; }
+                    #tb-align-left::before, #tb-align-center::before, #tb-align-right::before, #tb-align-justify::before {
+                        content: ''; position: absolute; left: 5px; right: 5px; top: 6px;
+                        height: 2px; background: currentColor;
+                        box-shadow: 0 5px 0 currentColor, 0 10px 0 currentColor, 0 15px 0 currentColor;
+                    }
+                    #tb-align-left::before { right: 8px; }
+                    #tb-align-center::before { left: 7px; right: 7px; }
+                    #tb-align-right::before { left: 8px; }
+                    #tb-align-justify::before { left: 5px; right: 5px; }
+                </style>
+                <div id="hwpx-zoom-indicator">
+                    <button id="hwpx-zoom-out" title="축소 (Ctrl+-)">−</button>
+                    <span id="hwpx-zoom-level" title="클릭하여 100%로 초기화">100%</span>
+                    <button id="hwpx-zoom-in" title="확대 (Ctrl++)">+</button>
+                </div>
+                <script>
+                (function() {
+                    var zoomLevel = 100;
+                    var MIN_ZOOM = 25;
+                    var MAX_ZOOM = 500;
+                    var ZOOM_STEP = 10;
+                    var scrollContainer = document.getElementById('hwpx-scroll-container');
+                    var wrapper = document.getElementById('hwpx-zoom-wrapper');
+                    var label = document.getElementById('hwpx-zoom-level');
+
+                    function applyZoom() {
+                        wrapper.style.zoom = zoomLevel / 100;
+                        label.textContent = zoomLevel + '%';
+                    }
+
+                    // Ctrl + 마우스 스크롤 (확대/축소)
+                    scrollContainer.addEventListener('wheel', function(e) {
+                        if (e.ctrlKey || e.metaKey) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            var oldZoom = zoomLevel;
+                            if (e.deltaY < 0) {
+                                zoomLevel = Math.min(MAX_ZOOM, zoomLevel + ZOOM_STEP);
+                            } else {
+                                zoomLevel = Math.max(MIN_ZOOM, zoomLevel - ZOOM_STEP);
+                            }
+                            if (oldZoom !== zoomLevel) {
+                                // 마우스 위치 기준으로 줌 (스크롤 위치 보정)
+                                var rect = scrollContainer.getBoundingClientRect();
+                                var mouseX = e.clientX - rect.left;
+                                var mouseY = e.clientY - rect.top;
+                                var ratio = zoomLevel / oldZoom;
+                                var newScrollLeft = (scrollContainer.scrollLeft + mouseX) * ratio - mouseX;
+                                var newScrollTop = (scrollContainer.scrollTop + mouseY) * ratio - mouseY;
+                                applyZoom();
+                                scrollContainer.scrollLeft = newScrollLeft;
+                                scrollContainer.scrollTop = newScrollTop;
+                            }
+                        }
+                    }, { passive: false });
+
+                    // Ctrl+= (확대), Ctrl+- (축소), Ctrl+0 (초기화)
+                    window.addEventListener('keydown', function(e) {
+                        if (e.ctrlKey || e.metaKey) {
+                            if (e.key === '=' || e.key === '+') {
+                                e.preventDefault();
+                                zoomLevel = Math.min(MAX_ZOOM, zoomLevel + ZOOM_STEP);
+                                applyZoom();
+                            } else if (e.key === '-') {
+                                e.preventDefault();
+                                zoomLevel = Math.max(MIN_ZOOM, zoomLevel - ZOOM_STEP);
+                                applyZoom();
+                            } else if (e.key === '0') {
+                                e.preventDefault();
+                                zoomLevel = 100;
+                                applyZoom();
+                            }
+                        }
+                    });
+
+                    // 버튼 클릭
+                    document.getElementById('hwpx-zoom-in').addEventListener('click', function() {
+                        zoomLevel = Math.min(MAX_ZOOM, zoomLevel + ZOOM_STEP);
+                        applyZoom();
+                    });
+                    document.getElementById('hwpx-zoom-out').addEventListener('click', function() {
+                        zoomLevel = Math.max(MIN_ZOOM, zoomLevel - ZOOM_STEP);
+                        applyZoom();
+                    });
+                    label.addEventListener('click', function() {
+                        zoomLevel = 100;
+                        applyZoom();
+                    });
+
+                    // View / Edit / Select 모드 전환
+                    var currentMode = 'view';
+                    var btnView = document.getElementById('hwpx-mode-view');
+                    var btnEdit = document.getElementById('hwpx-mode-edit');
+                    var btnSelect = document.getElementById('hwpx-mode-select');
+                    var toolbar = document.getElementById('hwpx-toolbar');
+                    var toast = document.getElementById('hwpx-toast');
+                    var toastTimer = null;
+                    var docUri = scrollContainer.getAttribute('data-doc-uri') || '';
+
+                    function showToast(msg) {
+                        toast.textContent = msg;
+                        toast.classList.add('show');
+                        if (toastTimer) clearTimeout(toastTimer);
+                        toastTimer = setTimeout(function() { toast.classList.remove('show'); }, 2000);
+                    }
+
+                    // 클릭된 요소에서 가장 가까운 data-hwpx 속성을 찾아 XPath 반환
+                    function buildHwpxPath(el) {
+                        // 가장 가까운 data-hwpx가 있는 요소 찾기
+                        var cur = el;
+                        var hwpxAttr = null;
+                        while (cur && cur !== wrapper) {
+                            if (cur.getAttribute && cur.getAttribute('data-hwpx')) {
+                                hwpxAttr = cur.getAttribute('data-hwpx');
+                                break;
+                            }
+                            cur = cur.parentElement;
+                        }
+                        if (!hwpxAttr) return null;
+
+                        // XML 파일 경로 찾기 (section container에서)
+                        var section = el.closest('.hwpx-page');
+                        var sectionFile = '';
+                        if (section) {
+                            // 페이지에서 원본 section container 추적
+                            var pages = wrapper.querySelectorAll('.hwpx-page');
+                            var sectionContainers = document.querySelectorAll('.hwpx-section-container');
+                            // section container의 data-hwpx-file 찾기
+                            for (var sci = 0; sci < sectionContainers.length; sci++) {
+                                var sf = sectionContainers[sci].getAttribute('data-hwpx-file');
+                                if (sf) { sectionFile = sf; break; }
+                            }
+                        }
+
+                        return {
+                            file: sectionFile,
+                            xpath: hwpxAttr,
+                            full: sectionFile + '#' + hwpxAttr
+                        };
+                    }
+
+                    function setMode(mode) {
+                        currentMode = mode;
+                        btnView.classList.toggle('active', mode === 'view');
+                        btnEdit.classList.toggle('active', mode === 'edit');
+                        btnSelect.classList.toggle('active', mode === 'select');
+                        toolbar.classList.toggle('visible', mode === 'edit');
+
+                        scrollContainer.classList.remove('edit-mode', 'select-mode');
+
+                        if (mode === 'edit') {
+                            scrollContainer.classList.add('edit-mode');
+                            wrapper.querySelectorAll('.hwpx-page div[class^="para-"], .hwpx-page div:not([class]), .hwpx-page td').forEach(function(el) {
+                                if (el.querySelector('table, img, figure, svg')) return;
+                                el.setAttribute('contenteditable', 'true');
+                            });
+                        } else {
+                            wrapper.querySelectorAll('[contenteditable]').forEach(function(el) {
+                                el.removeAttribute('contenteditable');
+                            });
+                            if (mode === 'select') {
+                                scrollContainer.classList.add('select-mode');
+                            }
+                        }
+                    }
+
+                    btnView.addEventListener('click', function() { setMode('view'); });
+                    btnEdit.addEventListener('click', function() { setMode('edit'); });
+                    btnSelect.addEventListener('click', function() { setMode('select'); });
+
+                    // Select 모드: 클릭 시 요소 경로 복사
+                    scrollContainer.addEventListener('click', function(e) {
+                        if (currentMode !== 'select') return;
+                        var target = e.target;
+                        if (!target || !target.closest) return;
+                        if (target.closest('#hwpx-zoom-indicator') || target.closest('#hwpx-mode-bar')) return;
+                        var page = target.closest('.hwpx-page');
+                        if (!page) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+
+                        var pathInfo = buildHwpxPath(target);
+                        if (!pathInfo) {
+                            showToast('No HWPX path found');
+                            return;
+                        }
+
+                        // 문서경로#XML파일#XPath 형식으로 복사
+                        var clipText = docUri + '#' + pathInfo.file + '#' + pathInfo.xpath;
+
+                        navigator.clipboard.writeText(clipText).then(function() {
+                            showToast('Copied: ' + pathInfo.file + '#' + pathInfo.xpath);
+                        }).catch(function() {
+                            showToast(pathInfo.file + '#' + pathInfo.xpath);
+                        });
+                    });
+
+                    // --- 텍스트 도구 상자 ---
+                    function execCmd(cmd, value) {
+                        document.execCommand(cmd, false, value || null);
+                    }
+
+                    // 굵게 / 기울임 / 밑줄 / 취소선
+                    document.getElementById('tb-bold').addEventListener('click', function() { execCmd('bold'); updateToolbarState(); });
+                    document.getElementById('tb-italic').addEventListener('click', function() { execCmd('italic'); updateToolbarState(); });
+                    document.getElementById('tb-underline').addEventListener('click', function() { execCmd('underline'); updateToolbarState(); });
+                    document.getElementById('tb-strike').addEventListener('click', function() { execCmd('strikeThrough'); updateToolbarState(); });
+
+                    // 글꼴 크기
+                    var fontSizeInput = document.getElementById('tb-fontsize');
+                    fontSizeInput.addEventListener('change', function() {
+                        var sel = window.getSelection();
+                        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+                        var size = fontSizeInput.value;
+                        // execCommand fontSize는 1~7만 지원 → span으로 직접 래핑
+                        var range = sel.getRangeAt(0);
+                        var span = document.createElement('span');
+                        span.style.fontSize = size + 'pt';
+                        try {
+                            range.surroundContents(span);
+                            sel.removeAllRanges();
+                            var nr = document.createRange();
+                            nr.selectNodeContents(span);
+                            sel.addRange(nr);
+                        } catch(e) {
+                            // 복잡한 선택 범위인 경우 execCommand 폴백
+                            execCmd('fontSize', '3');
+                        }
+                    });
+
+                    // 글자 색상
+                    document.getElementById('tb-forecolor').addEventListener('input', function(e) {
+                        execCmd('foreColor', e.target.value);
+                    });
+
+                    // 배경 색상
+                    document.getElementById('tb-backcolor').addEventListener('input', function(e) {
+                        execCmd('hiliteColor', e.target.value);
+                    });
+
+                    // 정렬
+                    document.getElementById('tb-align-left').addEventListener('click', function() { execCmd('justifyLeft'); updateToolbarState(); });
+                    document.getElementById('tb-align-center').addEventListener('click', function() { execCmd('justifyCenter'); updateToolbarState(); });
+                    document.getElementById('tb-align-right').addEventListener('click', function() { execCmd('justifyRight'); updateToolbarState(); });
+                    document.getElementById('tb-align-justify').addEventListener('click', function() { execCmd('justifyFull'); updateToolbarState(); });
+
+                    // 서식 제거
+                    document.getElementById('tb-remove-format').addEventListener('click', function() {
+                        execCmd('removeFormat');
+                        updateToolbarState();
+                    });
+
+                    // 선택 위치에 따라 도구 상자 상태 업데이트
+                    function updateToolbarState() {
+                        document.getElementById('tb-bold').classList.toggle('active', document.queryCommandState('bold'));
+                        document.getElementById('tb-italic').classList.toggle('active', document.queryCommandState('italic'));
+                        document.getElementById('tb-underline').classList.toggle('active', document.queryCommandState('underline'));
+                        document.getElementById('tb-strike').classList.toggle('active', document.queryCommandState('strikeThrough'));
+                        document.getElementById('tb-align-left').classList.toggle('active', document.queryCommandState('justifyLeft'));
+                        document.getElementById('tb-align-center').classList.toggle('active', document.queryCommandState('justifyCenter'));
+                        document.getElementById('tb-align-right').classList.toggle('active', document.queryCommandState('justifyRight'));
+                        document.getElementById('tb-align-justify').classList.toggle('active', document.queryCommandState('justifyFull'));
+                        // 현재 폰트 사이즈 감지
+                        var sel = window.getSelection();
+                        if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+                            var node = sel.anchorNode;
+                            if (node && node.nodeType === 3) node = node.parentElement;
+                            if (node) {
+                                var computed = window.getComputedStyle(node);
+                                var px = parseFloat(computed.fontSize);
+                                if (px) fontSizeInput.value = Math.round(px * 0.75); // px → pt
+                            }
+                        }
+                    }
+
+                    document.addEventListener('selectionchange', function() {
+                        if (currentMode === 'edit') updateToolbarState();
+                    });
+
+                    // 드래그로 뷰 이동 (View 모드에서만)
+                    var isDragging = false;
+                    var dragStartX = 0, dragStartY = 0;
+                    var scrollStartX = 0, scrollStartY = 0;
+
+                    scrollContainer.addEventListener('mousedown', function(e) {
+                        // Edit/Select 모드에서는 드래그 비활성
+                        if (currentMode !== 'view') return;
+                        // 버튼, 링크, 입력 요소 위에서는 드래그 안 함
+                        var tag = e.target.tagName;
+                        if (tag === 'A' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+                        // 줌 인디케이터, 모드 바 내부 클릭 무시
+                        if (e.target.closest('#hwpx-zoom-indicator') || e.target.closest('#hwpx-mode-bar')) return;
+                        isDragging = true;
+                        dragStartX = e.clientX;
+                        dragStartY = e.clientY;
+                        scrollStartX = scrollContainer.scrollLeft;
+                        scrollStartY = scrollContainer.scrollTop;
+                        scrollContainer.classList.add('dragging');
+                        e.preventDefault();
+                    });
+
+                    window.addEventListener('mousemove', function(e) {
+                        if (!isDragging) return;
+                        var dx = e.clientX - dragStartX;
+                        var dy = e.clientY - dragStartY;
+                        scrollContainer.scrollLeft = scrollStartX - dx;
+                        scrollContainer.scrollTop = scrollStartY - dy;
+                    });
+
+                    window.addEventListener('mouseup', function() {
+                        if (isDragging) {
+                            isDragging = false;
+                            scrollContainer.classList.remove('dragging');
+                        }
+                    });
+                })();
+                </script>`;
+
+            webviewPanel.webview.html = this.getHtmlForWebview(headerHtml + bodyHtml);
+
+        } catch (e: any) {
+            webviewPanel.webview.html = this.getHtmlForWebview(`<h2>오류 발생</h2><p>${e.message}</p>`);
+        }
+    }
+
+    private getLoadingHtml(): string {
+        return `<!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <title>HWPX View</title>
+        </head>
+        <body>
+            <h2>HWPX 문서를 불러오는 중입니다...</h2>
+        </body>
+        </html>`;
+    }
+
+    private getHtmlForWebview(content: string): string {
+        return `<!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>HWPX Viewer</title>
+            <style>
+                body {
+                    font-family: var(--vscode-font-family);
+                    margin: 0;
+                    padding: 0;
+                    color: var(--vscode-editor-foreground);
+                    background-color: var(--vscode-editor-background);
+                    overflow: hidden;
+                    width: 100%;
+                    height: 100vh;
+                }
+            </style>
+        </head>
+        <body>
+            ${content}
+        </body>
+        </html>`;
+    }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "HWPX Extension Dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  },
+  "forwardPorts": [],
+  "postCreateCommand": "npm install"
+}

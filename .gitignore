@@ -1,0 +1,10 @@
+node_modules/
+out/
+references/
+.agents/
+.claude/
+prompts/
+*.hwpx
+*.pdf
+*.vsix
+openhwp/
