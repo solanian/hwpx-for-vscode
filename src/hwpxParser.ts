@@ -992,11 +992,9 @@ export class HwpxParser {
                                     }
 
                                     // splitLevel === 0: 첫 번째 자식(블록)만으로도 넘침
-                                    // → 줄(line-height) 단위로 스냅하여 overflow clip
-                                    var topTr2 = rowNode.cloneNode(false);
-                                    var bottomTr2 = rowNode.cloneNode(false);
+                                    // → Range.getClientRects()로 실제 줄 위치를 측정하여 줄 경계에서 clip
 
-                                    // 줄 높이를 측정하기 위해 전체 내용을 측정 컨테이너에 배치
+                                    // 실제 줄 위치 측정을 위해 테이블 컨텍스트에서 렌더링
                                     var mTbl = tblRef.cloneNode(false);
                                     mTbl.style.margin = '0';
                                     if (thRef) mTbl.appendChild(thRef.cloneNode(true));
@@ -1012,35 +1010,57 @@ export class HwpxParser {
                                         var contentMaxH = maxH - cellPads[ci6].pt - cellPads[ci6].pb;
                                         if (contentMaxH < 1) contentMaxH = 1;
 
-                                        // 셀 내부의 텍스트 요소에서 line-height 측정
-                                        var textEl = mCells[ci6].querySelector('div, p, span');
-                                        var lh = 0;
-                                        if (textEl) {
-                                            var lhStr = getComputedStyle(textEl).lineHeight;
-                                            lh = parseFloat(lhStr);
-                                            if (isNaN(lh) || lhStr === 'normal') {
-                                                var fs = parseFloat(getComputedStyle(textEl).fontSize) || 12;
-                                                lh = Math.round(fs * 1.5);
+                                        var tdRect = mCells[ci6].getBoundingClientRect();
+                                        var contentStart = tdRect.top + cellPads[ci6].pt;
+
+                                        // 1) 텍스트 노드의 실제 줄 위치를 Range.getClientRects()로 수집
+                                        var lineBottoms = [];
+                                        var walker = document.createTreeWalker(mCells[ci6], NodeFilter.SHOW_TEXT, null);
+                                        var tNode;
+                                        while (tNode = walker.nextNode()) {
+                                            var range = document.createRange();
+                                            range.selectNode(tNode);
+                                            var rects = range.getClientRects();
+                                            for (var ri = 0; ri < rects.length; ri++) {
+                                                var bot = rects[ri].bottom - contentStart;
+                                                if (bot > 0.5) lineBottoms.push(bot);
                                             }
                                         }
 
-                                        if (lh > 0) {
-                                            // 첫 번째 블록의 margin/padding 오버헤드 계산
-                                            var firstBlock = mCells[ci6].firstElementChild;
-                                            var overhead = 0;
-                                            if (firstBlock) {
-                                                var fbCs = getComputedStyle(firstBlock);
-                                                overhead = (parseFloat(fbCs.marginTop) || 0) + (parseFloat(fbCs.paddingTop) || 0);
-                                            }
-                                            var availForLines = contentMaxH - overhead;
-                                            var numLines = Math.floor(availForLines / lh);
-                                            if (numLines < 1) numLines = 1;
-                                            clipHeights.push(overhead + numLines * lh);
-                                        } else {
-                                            clipHeights.push(contentMaxH);
+                                        // 2) 블록 요소(div, p, img, table 등) 경계도 수집
+                                        var blockEls = mCells[ci6].querySelectorAll('div, p, table, img, ul, ol, li');
+                                        for (var bi = 0; bi < blockEls.length; bi++) {
+                                            var bRect = blockEls[bi].getBoundingClientRect();
+                                            var bBot = bRect.bottom - contentStart;
+                                            if (bBot > 0.5) lineBottoms.push(bBot);
                                         }
+
+                                        // 정렬 및 중복 제거 (1px 이내 동일 취급)
+                                        lineBottoms.sort(function(a, b) { return a - b; });
+                                        var unique = [];
+                                        for (var ui = 0; ui < lineBottoms.length; ui++) {
+                                            if (ui === 0 || Math.abs(lineBottoms[ui] - lineBottoms[ui - 1]) > 1) {
+                                                unique.push(lineBottoms[ui]);
+                                            }
+                                        }
+
+                                        // 마지막으로 들어맞는 줄 경계 찾기
+                                        var clipH = 0;
+                                        for (var li = 0; li < unique.length; li++) {
+                                            if (unique[li] <= contentMaxH + 0.5) {
+                                                clipH = unique[li];
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        // 최소 첫 줄은 표시 (무한루프 방지)
+                                        if (clipH < 1 && unique.length > 0) clipH = unique[0];
+                                        clipHeights.push(clipH > 0 ? clipH : contentMaxH);
                                     }
                                     measure.removeChild(mTbl);
+
+                                    var topTr2 = rowNode.cloneNode(false);
+                                    var bottomTr2 = rowNode.cloneNode(false);
 
                                     for (var ci7 = 0; ci7 < cells.length; ci7++) {
                                         var topCell2 = cells[ci7].cloneNode(false);
@@ -1048,8 +1068,8 @@ export class HwpxParser {
                                         topCell2.style.height = 'auto';
                                         bottomCell2.style.height = 'auto';
 
-                                        var clipH = clipHeights[ci7] || 1;
-                                        if (clipH < 1) clipH = 1;
+                                        var finalClipH = clipHeights[ci7] || 1;
+                                        if (finalClipH < 1) finalClipH = 1;
 
                                         var kids2 = Array.from(cells[ci7].childNodes);
                                         if (kids2.length === 0) {
@@ -1058,10 +1078,10 @@ export class HwpxParser {
                                             continue;
                                         }
 
-                                        // Top: 줄 단위로 스냅된 높이만큼 표시
+                                        // Top: 실제 줄 경계까지만 표시
                                         var topWrap = document.createElement('div');
                                         topWrap.style.overflow = 'hidden';
-                                        topWrap.style.maxHeight = clipH + 'px';
+                                        topWrap.style.maxHeight = finalClipH + 'px';
                                         for (var k = 0; k < kids2.length; k++) {
                                             topWrap.appendChild(kids2[k].cloneNode(true));
                                         }
@@ -1071,7 +1091,7 @@ export class HwpxParser {
                                         var botOuter = document.createElement('div');
                                         botOuter.style.overflow = 'hidden';
                                         var botInner = document.createElement('div');
-                                        botInner.style.marginTop = '-' + clipH + 'px';
+                                        botInner.style.marginTop = '-' + finalClipH + 'px';
                                         for (var k2 = 0; k2 < kids2.length; k2++) {
                                             botInner.appendChild(kids2[k2].cloneNode(true));
                                         }
