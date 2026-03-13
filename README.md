@@ -131,6 +131,60 @@ curl -X PUT ... -d '{"json": [{"#text": "새 내용"}]}'
 5. Select 모드에서 수정할 요소를 클릭 → 경로 복사 → LLM에 전달
 6. LLM이 `PUT /api/element`로 수정 → `POST /api/save`로 저장
 
+## LLM 활용 예시 시나리오
+
+### 시나리오 1: 월간 보고서 내용 일괄 수정
+
+> "이번 달 업무실적서에서 '1월'을 모두 '2월'로 바꿔줘"
+
+1. VS Code에서 `.hwpx` 파일을 열면 자동으로 API 서버가 시작됩니다
+2. `Ctrl+Shift+P` → `HWPX: Copy API Help URL` → LLM 채팅에 URL을 붙여넣기
+3. `Ctrl+Shift+P` → `HWPX: Show API Server Port` → "Copy Token" → LLM에 토큰 전달
+4. LLM이 자동으로 API를 호출하여 문서를 탐색하고 수정합니다:
+
+```bash
+# LLM이 실행하는 명령들 (자동)
+# 1. 문서 구조 파악
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/files
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/xml?file=Contents/section0.xml"
+
+# 2. 대상 요소 찾기
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$PORT/api/element?file=Contents/section0.xml&xpath=/hs:sec//hp:t[0]"
+
+# 3. 텍스트 수정
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  "http://127.0.0.1:$PORT/api/element?file=Contents/section0.xml&xpath=/hs:sec/hp:tbl/hp:tr[1]/hp:tc[0]/hp:p[0]/hp:run[0]/hp:t" \
+  -d '{"text": "2월"}'
+
+# 4. 저장 (뷰어 자동 새로고침)
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/save
+```
+
+### 시나리오 2: Select 모드로 정확한 요소 지정
+
+> "이 표에서 3번째 행의 실적 칸을 '완료'로 바꿔줘"
+
+1. 뷰어 우상단에서 **Select** 모드로 전환
+2. 수정할 셀을 클릭 → XPath가 클립보드에 복사됨
+   - 예: `/home/user/report.hwpx#Contents/section0.xml#/hs:sec/hp:tbl/hp:tr[3]/hp:tc[2]/hp:p[0]/hp:run[0]/hp:t`
+3. 이 경로를 LLM에 붙여넣기: "이 경로의 내용을 '완료'로 바꿔줘"
+4. LLM이 정확한 XPath로 해당 요소만 수정
+
+### 시나리오 3: 문서 구조 분석
+
+> "이 HWPX 문서에 표가 몇 개 있고, 각각 몇 행인지 알려줘"
+
+LLM이 `/api/xml`로 XML을 읽어 구조를 분석하고 답변합니다. 문서를 직접 파싱할 필요 없이 API를 통해 프로그래밍 방식으로 접근할 수 있습니다.
+
+### 시나리오 4: Claude Code / Cursor 등 AI IDE에서 직접 사용
+
+AI 코딩 도구에서 터미널을 통해 curl 명령을 직접 실행할 수 있으므로, HWPX 문서 수정을 코딩 워크플로우에 통합할 수 있습니다:
+
+1. VS Code에서 `.hwpx` 파일을 열어둔 상태로
+2. AI IDE에 `/api/help` URL과 토큰을 알려주면
+3. AI가 자율적으로 문서를 탐색, 수정, 저장합니다
+
 ### Security
 - 서버는 `127.0.0.1`에만 바인딩 (외부 접근 불가)
 - 랜덤 토큰 인증 필수

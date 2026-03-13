@@ -917,75 +917,171 @@ export class HwpxParser {
                                     availH = contentMaxH;
                                 }
 
-                                // 행의 셀 내용을 높이 기준으로 픽셀 단위 overflow clip 분리
+                                // 행의 셀 내용을 블록(문단) 단위로 분리, 단일 블록이 넘칠 경우 줄(line) 단위 스냅
                                 function splitRowAtHeight(tblRef, thRef, rowNode, maxH) {
                                     var cells = Array.from(rowNode.querySelectorAll(':scope > td, :scope > th'));
 
-                                    // 셀 패딩 측정 (정확한 clip 높이 계산용)
+                                    // 측정용 테이블 구성 (정확한 열 너비 재현)
                                     var tmpTbl = tblRef.cloneNode(false);
                                     tmpTbl.style.margin = '0';
                                     if (thRef) tmpTbl.appendChild(thRef.cloneNode(true));
                                     var tmpTb = document.createElement('tbody');
-                                    var tmpTr = rowNode.cloneNode(true);
+                                    var tmpTr = rowNode.cloneNode(false);
+
+                                    var tmpCells = [];
+                                    var cellKids = [];
+                                    var maxChildCount = 0;
+                                    var cellPads = [];
+                                    for (var ci2 = 0; ci2 < cells.length; ci2++) {
+                                        var emptyCell = cells[ci2].cloneNode(false);
+                                        tmpTr.appendChild(emptyCell);
+                                        tmpCells.push(emptyCell);
+                                        var kids = Array.from(cells[ci2].childNodes);
+                                        cellKids.push(kids);
+                                        if (kids.length > maxChildCount) maxChildCount = kids.length;
+                                    }
                                     tmpTb.appendChild(tmpTr);
                                     tmpTbl.appendChild(tmpTb);
                                     measure.appendChild(tmpTbl);
 
-                                    var tmpCells = Array.from(tmpTr.querySelectorAll(':scope > td, :scope > th'));
-                                    var cellPads = [];
-                                    for (var ci2 = 0; ci2 < tmpCells.length; ci2++) {
-                                        var cs = getComputedStyle(tmpCells[ci2]);
+                                    // 셀 패딩 측정
+                                    for (var ci3 = 0; ci3 < tmpCells.length; ci3++) {
+                                        var cs = getComputedStyle(tmpCells[ci3]);
                                         cellPads.push({
                                             pt: parseFloat(cs.paddingTop) || 0,
                                             pb: parseFloat(cs.paddingBottom) || 0
                                         });
                                     }
+
+                                    // 블록(문단) 단위로 자식 노드를 하나씩 추가하며 높이 측정
+                                    var splitLevel = maxChildCount;
+                                    for (var level = 0; level < maxChildCount; level++) {
+                                        for (var ci4 = 0; ci4 < cells.length; ci4++) {
+                                            if (level < cellKids[ci4].length) {
+                                                tmpCells[ci4].appendChild(cellKids[ci4][level].cloneNode(true));
+                                            }
+                                        }
+                                        var h = tmpTr.getBoundingClientRect().height;
+                                        if (h > maxH) {
+                                            splitLevel = level;
+                                            break;
+                                        }
+                                    }
                                     measure.removeChild(tmpTbl);
 
-                                    // top (클리핑) / bottom (나머지) 행 생성
-                                    var topTr = rowNode.cloneNode(false);
-                                    var bottomTr = rowNode.cloneNode(false);
-
-                                    for (var ci3 = 0; ci3 < cells.length; ci3++) {
-                                        var topCell = cells[ci3].cloneNode(false);
-                                        var bottomCell = cells[ci3].cloneNode(false);
-                                        topCell.style.height = 'auto';
-                                        bottomCell.style.height = 'auto';
-
-                                        var contentClipH = maxH - cellPads[ci3].pt - cellPads[ci3].pb;
-                                        if (contentClipH < 1) contentClipH = 1;
-
-                                        var kids = Array.from(cells[ci3].childNodes);
-                                        if (kids.length === 0) {
+                                    // splitLevel > 0: 블록(문단) 경계에서 깔끔하게 분리
+                                    if (splitLevel > 0) {
+                                        var topTr = rowNode.cloneNode(false);
+                                        var bottomTr = rowNode.cloneNode(false);
+                                        for (var ci5 = 0; ci5 < cells.length; ci5++) {
+                                            var topCell = cells[ci5].cloneNode(false);
+                                            var bottomCell = cells[ci5].cloneNode(false);
+                                            topCell.style.height = 'auto';
+                                            bottomCell.style.height = 'auto';
+                                            for (var ki = 0; ki < cellKids[ci5].length; ki++) {
+                                                if (ki < splitLevel) {
+                                                    topCell.appendChild(cellKids[ci5][ki].cloneNode(true));
+                                                } else {
+                                                    bottomCell.appendChild(cellKids[ci5][ki].cloneNode(true));
+                                                }
+                                            }
                                             topTr.appendChild(topCell);
                                             bottomTr.appendChild(bottomCell);
+                                        }
+                                        return { topRow: topTr, bottomRow: bottomTr };
+                                    }
+
+                                    // splitLevel === 0: 첫 번째 자식(블록)만으로도 넘침
+                                    // → 줄(line-height) 단위로 스냅하여 overflow clip
+                                    var topTr2 = rowNode.cloneNode(false);
+                                    var bottomTr2 = rowNode.cloneNode(false);
+
+                                    // 줄 높이를 측정하기 위해 전체 내용을 측정 컨테이너에 배치
+                                    var mTbl = tblRef.cloneNode(false);
+                                    mTbl.style.margin = '0';
+                                    if (thRef) mTbl.appendChild(thRef.cloneNode(true));
+                                    var mTb = document.createElement('tbody');
+                                    var mTr = rowNode.cloneNode(true);
+                                    mTb.appendChild(mTr);
+                                    mTbl.appendChild(mTb);
+                                    measure.appendChild(mTbl);
+                                    var mCells = Array.from(mTr.querySelectorAll(':scope > td, :scope > th'));
+
+                                    var clipHeights = [];
+                                    for (var ci6 = 0; ci6 < mCells.length; ci6++) {
+                                        var contentMaxH = maxH - cellPads[ci6].pt - cellPads[ci6].pb;
+                                        if (contentMaxH < 1) contentMaxH = 1;
+
+                                        // 셀 내부의 텍스트 요소에서 line-height 측정
+                                        var textEl = mCells[ci6].querySelector('div, p, span');
+                                        var lh = 0;
+                                        if (textEl) {
+                                            var lhStr = getComputedStyle(textEl).lineHeight;
+                                            lh = parseFloat(lhStr);
+                                            if (isNaN(lh) || lhStr === 'normal') {
+                                                var fs = parseFloat(getComputedStyle(textEl).fontSize) || 12;
+                                                lh = Math.round(fs * 1.5);
+                                            }
+                                        }
+
+                                        if (lh > 0) {
+                                            // 첫 번째 블록의 margin/padding 오버헤드 계산
+                                            var firstBlock = mCells[ci6].firstElementChild;
+                                            var overhead = 0;
+                                            if (firstBlock) {
+                                                var fbCs = getComputedStyle(firstBlock);
+                                                overhead = (parseFloat(fbCs.marginTop) || 0) + (parseFloat(fbCs.paddingTop) || 0);
+                                            }
+                                            var availForLines = contentMaxH - overhead;
+                                            var numLines = Math.floor(availForLines / lh);
+                                            if (numLines < 1) numLines = 1;
+                                            clipHeights.push(overhead + numLines * lh);
+                                        } else {
+                                            clipHeights.push(contentMaxH);
+                                        }
+                                    }
+                                    measure.removeChild(mTbl);
+
+                                    for (var ci7 = 0; ci7 < cells.length; ci7++) {
+                                        var topCell2 = cells[ci7].cloneNode(false);
+                                        var bottomCell2 = cells[ci7].cloneNode(false);
+                                        topCell2.style.height = 'auto';
+                                        bottomCell2.style.height = 'auto';
+
+                                        var clipH = clipHeights[ci7] || 1;
+                                        if (clipH < 1) clipH = 1;
+
+                                        var kids2 = Array.from(cells[ci7].childNodes);
+                                        if (kids2.length === 0) {
+                                            topTr2.appendChild(topCell2);
+                                            bottomTr2.appendChild(bottomCell2);
                                             continue;
                                         }
 
-                                        // Top: overflow hidden으로 contentClipH만큼만 표시
+                                        // Top: 줄 단위로 스냅된 높이만큼 표시
                                         var topWrap = document.createElement('div');
                                         topWrap.style.overflow = 'hidden';
-                                        topWrap.style.maxHeight = contentClipH + 'px';
-                                        for (var k = 0; k < kids.length; k++) {
-                                            topWrap.appendChild(kids[k].cloneNode(true));
+                                        topWrap.style.maxHeight = clipH + 'px';
+                                        for (var k = 0; k < kids2.length; k++) {
+                                            topWrap.appendChild(kids2[k].cloneNode(true));
                                         }
-                                        topCell.appendChild(topWrap);
+                                        topCell2.appendChild(topWrap);
 
-                                        // Bottom: 이미 표시된 부분을 negative margin으로 건너뛰기
+                                        // Bottom: 표시된 부분을 건너뛰고 나머지 표시
                                         var botOuter = document.createElement('div');
                                         botOuter.style.overflow = 'hidden';
                                         var botInner = document.createElement('div');
-                                        botInner.style.marginTop = '-' + contentClipH + 'px';
-                                        for (var k2 = 0; k2 < kids.length; k2++) {
-                                            botInner.appendChild(kids[k2].cloneNode(true));
+                                        botInner.style.marginTop = '-' + clipH + 'px';
+                                        for (var k2 = 0; k2 < kids2.length; k2++) {
+                                            botInner.appendChild(kids2[k2].cloneNode(true));
                                         }
                                         botOuter.appendChild(botInner);
-                                        bottomCell.appendChild(botOuter);
+                                        bottomCell2.appendChild(botOuter);
 
-                                        topTr.appendChild(topCell);
-                                        bottomTr.appendChild(bottomCell);
+                                        topTr2.appendChild(topCell2);
+                                        bottomTr2.appendChild(bottomCell2);
                                     }
-                                    return { topRow: topTr, bottomRow: bottomTr };
+                                    return { topRow: topTr2, bottomRow: bottomTr2 };
                                 }
 
                                 var rowIdx = 0;
