@@ -917,67 +917,71 @@ export class HwpxParser {
                                     availH = contentMaxH;
                                 }
 
-                                // 행의 셀 내용을 높이 기준으로 DOM 분리 (모든 셀을 함께 측정)
+                                // 행의 셀 내용을 높이 기준으로 픽셀 단위 overflow clip 분리
                                 function splitRowAtHeight(tblRef, thRef, rowNode, maxH) {
                                     var cells = Array.from(rowNode.querySelectorAll(':scope > td, :scope > th'));
 
-                                    // 정확한 열 너비 재현을 위해 전체 테이블 구조로 측정
+                                    // 셀 패딩 측정 (정확한 clip 높이 계산용)
                                     var tmpTbl = tblRef.cloneNode(false);
                                     tmpTbl.style.margin = '0';
                                     if (thRef) tmpTbl.appendChild(thRef.cloneNode(true));
                                     var tmpTb = document.createElement('tbody');
-                                    var tmpTr = rowNode.cloneNode(false);
-
-                                    // 모든 셀을 빈 상태로 추가 (열 너비 속성 유지)
-                                    var tmpCells = [];
-                                    var cellKids = [];
-                                    var maxChildCount = 0;
-                                    for (var ci2 = 0; ci2 < cells.length; ci2++) {
-                                        var emptyCell = cells[ci2].cloneNode(false);
-                                        tmpTr.appendChild(emptyCell);
-                                        tmpCells.push(emptyCell);
-                                        var kids = Array.from(cells[ci2].childNodes);
-                                        cellKids.push(kids);
-                                        if (kids.length > maxChildCount) maxChildCount = kids.length;
-                                    }
+                                    var tmpTr = rowNode.cloneNode(true);
                                     tmpTb.appendChild(tmpTr);
                                     tmpTbl.appendChild(tmpTb);
                                     measure.appendChild(tmpTbl);
 
-                                    // 자식 노드를 level별로 동시에 추가하며 전체 행 높이 측정
-                                    var splitLevel = maxChildCount;
-                                    for (var level = 0; level < maxChildCount; level++) {
-                                        for (var ci3 = 0; ci3 < cells.length; ci3++) {
-                                            if (level < cellKids[ci3].length) {
-                                                tmpCells[ci3].appendChild(cellKids[ci3][level].cloneNode(true));
-                                            }
-                                        }
-                                        var h = tmpTr.getBoundingClientRect().height;
-                                        if (h > maxH) {
-                                            splitLevel = level;
-                                            break;
-                                        }
+                                    var tmpCells = Array.from(tmpTr.querySelectorAll(':scope > td, :scope > th'));
+                                    var cellPads = [];
+                                    for (var ci2 = 0; ci2 < tmpCells.length; ci2++) {
+                                        var cs = getComputedStyle(tmpCells[ci2]);
+                                        cellPads.push({
+                                            pt: parseFloat(cs.paddingTop) || 0,
+                                            pb: parseFloat(cs.paddingBottom) || 0
+                                        });
                                     }
                                     measure.removeChild(tmpTbl);
 
-                                    // splitLevel=0이면 첫 자식도 안 맞음 → 최소 1개는 강제 포함 (무한루프 방지)
-                                    if (splitLevel === 0 && maxChildCount > 0 && maxH >= contentMaxH * 0.8) {
-                                        splitLevel = 1;
-                                    }
-
-                                    // top/bottom 행 생성
+                                    // top (클리핑) / bottom (나머지) 행 생성
                                     var topTr = rowNode.cloneNode(false);
                                     var bottomTr = rowNode.cloneNode(false);
-                                    for (var ci4 = 0; ci4 < cells.length; ci4++) {
-                                        var topCell = cells[ci4].cloneNode(false);
-                                        var bottomCell = cells[ci4].cloneNode(false);
-                                        for (var ki = 0; ki < cellKids[ci4].length; ki++) {
-                                            if (ki < splitLevel) {
-                                                topCell.appendChild(cellKids[ci4][ki].cloneNode(true));
-                                            } else {
-                                                bottomCell.appendChild(cellKids[ci4][ki].cloneNode(true));
-                                            }
+
+                                    for (var ci3 = 0; ci3 < cells.length; ci3++) {
+                                        var topCell = cells[ci3].cloneNode(false);
+                                        var bottomCell = cells[ci3].cloneNode(false);
+                                        topCell.style.height = 'auto';
+                                        bottomCell.style.height = 'auto';
+
+                                        var contentClipH = maxH - cellPads[ci3].pt - cellPads[ci3].pb;
+                                        if (contentClipH < 1) contentClipH = 1;
+
+                                        var kids = Array.from(cells[ci3].childNodes);
+                                        if (kids.length === 0) {
+                                            topTr.appendChild(topCell);
+                                            bottomTr.appendChild(bottomCell);
+                                            continue;
                                         }
+
+                                        // Top: overflow hidden으로 contentClipH만큼만 표시
+                                        var topWrap = document.createElement('div');
+                                        topWrap.style.overflow = 'hidden';
+                                        topWrap.style.maxHeight = contentClipH + 'px';
+                                        for (var k = 0; k < kids.length; k++) {
+                                            topWrap.appendChild(kids[k].cloneNode(true));
+                                        }
+                                        topCell.appendChild(topWrap);
+
+                                        // Bottom: 이미 표시된 부분을 negative margin으로 건너뛰기
+                                        var botOuter = document.createElement('div');
+                                        botOuter.style.overflow = 'hidden';
+                                        var botInner = document.createElement('div');
+                                        botInner.style.marginTop = '-' + contentClipH + 'px';
+                                        for (var k2 = 0; k2 < kids.length; k2++) {
+                                            botInner.appendChild(kids[k2].cloneNode(true));
+                                        }
+                                        botOuter.appendChild(botInner);
+                                        bottomCell.appendChild(botOuter);
+
                                         topTr.appendChild(topCell);
                                         bottomTr.appendChild(bottomCell);
                                     }
@@ -1045,17 +1049,9 @@ export class HwpxParser {
                                             var spaceLeft = pageAvail - baseH;
                                             if (spaceLeft > 10) {
                                                 var sp = splitRowAtHeight(child, origThead, bodyRows[rowIdx], spaceLeft);
-                                                // 위쪽이 내용이 있는지 확인
-                                                var hasTop = false;
-                                                var tCells = sp.topRow.querySelectorAll('td, th');
-                                                for (var tc = 0; tc < tCells.length; tc++) {
-                                                    if (tCells[tc].childNodes.length > 0) { hasTop = true; break; }
-                                                }
-                                                if (hasTop) {
-                                                    liveTb.appendChild(sp.topRow);
-                                                    pendingBottomRow = sp.bottomRow;
-                                                    rowIdx++;
-                                                }
+                                                liveTb.appendChild(sp.topRow);
+                                                pendingBottomRow = sp.bottomRow;
+                                                rowIdx++;
                                             }
                                             break;
                                         }
