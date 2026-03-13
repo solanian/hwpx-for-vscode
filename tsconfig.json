@@ -13,6 +13,8 @@
     "node_modules",
     ".vscode-test",
     "references",
-    ".agent"
+    ".agent",
+    "test",
+    "out-test"
   ]
 }

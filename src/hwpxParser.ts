@@ -629,13 +629,13 @@ export class HwpxParser {
 
             try {
                 const processedSectionXml = sectionXml
-                    .replace(/<hp:lineBreak\s*\/>/g, '\n')
-                    .replace(/<hp:tab[^\/]*\/>/g, '\t')
-                    .replace(/<hp:nbSpace\s*\/>/g, '\u00A0')
-                    .replace(/<hp:fwSpace\s*\/>/g, '\u3000')
-                    .replace(/<hp:hyphen\s*\/>/g, '\u00AD')
-                    .replace(/<hp:bookmark\b[^>]*\/>/g, '')
-                    .replace(/<hp:titleMark\b[^>]*\/>/g, '')
+                    .replace(/<hp:lineBreak\s*\/>|<hp:lineBreak\s*><\/hp:lineBreak>/g, '\n')
+                    .replace(/<hp:tab[^\/]*\/>|<hp:tab[^>]*><\/hp:tab>/g, '\t')
+                    .replace(/<hp:nbSpace\s*\/>|<hp:nbSpace\s*><\/hp:nbSpace>/g, '\u00A0')
+                    .replace(/<hp:fwSpace\s*\/>|<hp:fwSpace\s*><\/hp:fwSpace>/g, '\u3000')
+                    .replace(/<hp:hyphen\s*\/>|<hp:hyphen\s*><\/hp:hyphen>/g, '\u00AD')
+                    .replace(/<hp:bookmark\b[^>]*\/>|<hp:bookmark\b[^>]*><\/hp:bookmark>/g, '')
+                    .replace(/<hp:titleMark\b[^>]*\/>|<hp:titleMark\b[^>]*><\/hp:titleMark>/g, '')
                     .replace(/<hp:markpenBegin\b[^>]*?color="([^"]*)"[^>]*?\/?>/g, '\uE000$1\uE001')
                     .replace(/<hp:markpenEnd\s*\/?>/g, '\uE002')
                     .replace(/<hp:pageNum\b[^>]*\/>/g, '\uE003')
@@ -746,8 +746,11 @@ export class HwpxParser {
                     }
                 }
 
-                const sectionXmlPath = sectionPath.replace('.xml', '');  // "Contents/section0"
-                const sectionHtml = this.extractHtml(sectionObj, imageMap, sectionXmlPath);
+                // 실제 XML 루트 태그를 경로에 반영 (hs:sec, hp:sec 등)
+                const rootTag = Object.keys(sectionObj).find(k => !k.startsWith('@_') && !k.startsWith('#') && !k.startsWith('?')) || 'hs:sec';
+                const sectionXmlPath = `/${rootTag}`;
+                const rootObj = sectionObj[rootTag] || sectionObj;
+                const sectionHtml = this.extractHtml(rootObj, imageMap, sectionXmlPath);
                 const headerDataAttr = headerHtml ? ` data-header="${encodeURIComponent(headerHtml)}"` : '';
                 const footerDataAttr = footerHtml ? ` data-footer="${encodeURIComponent(footerHtml)}"` : '';
                 const headerPosAttr = headerMm ? ` data-header-top="${headerMm.toFixed(1)}"` : '';
@@ -1289,7 +1292,7 @@ export class HwpxParser {
 
                             html += `<td colspan="${colSpan}" rowspan="${rowSpan}" data-hwpx="${tcPath}" style="${cellPadding} ${borderCss} word-break: break-word; vertical-align: ${vAlign}; ${cellStyle} ${cellHeightStyle} ${bgColor}">`;
                             if (subList) {
-                                html += this.extractHtml(subList, imageMap, tcPath);
+                                html += this.extractHtml(subList, imageMap, `${tcPath}/hp:subList`);
                             } else {
                                 html += this.extractHtml(tc, imageMap, tcPath);
                             }
