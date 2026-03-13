@@ -1,13 +1,37 @@
 {
   "name": "vscode-hwpx",
   "displayName": "HWPX Viewer",
-  "description": "Custom Editor for Hancom HWPX files",
+  "description": "한컴 HWPX(한/글 2014+) 문서를 VS Code에서 열어보고, AI 에이전트가 HTTP API로 문서를 조작할 수 있는 확장입니다. (Beta)",
   "version": "0.0.1",
+  "publisher": "solanian",
+  "preview": true,
+  "icon": "icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solanian/hwpx-for-vscode"
+  },
+  "homepage": "https://github.com/solanian/hwpx-for-vscode#readme",
+  "bugs": {
+    "url": "https://github.com/solanian/hwpx-for-vscode/issues"
+  },
+  "keywords": [
+    "hwpx",
+    "hwp",
+    "hancom",
+    "한글",
+    "한컴",
+    "viewer",
+    "custom-editor",
+    "owpml",
+    "document"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Visualization"
   ],
   "activationEvents": [],
   "main": "./out/extension.js",
