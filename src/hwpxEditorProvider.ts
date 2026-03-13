@@ -434,6 +434,32 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                                 zoomLevel = 100;
                                 applyZoom();
                             }
+                            // Edit 모드 단축키: Undo/Redo, Bold/Italic/Underline
+                            if (currentMode === 'edit') {
+                                if (e.key === 'z' || e.key === 'Z') {
+                                    e.preventDefault();
+                                    if (e.shiftKey) {
+                                        document.execCommand('redo', false, null);
+                                    } else {
+                                        document.execCommand('undo', false, null);
+                                    }
+                                } else if (e.key === 'y' || e.key === 'Y') {
+                                    e.preventDefault();
+                                    document.execCommand('redo', false, null);
+                                } else if (e.key === 'b' || e.key === 'B') {
+                                    e.preventDefault();
+                                    document.execCommand('bold', false, null);
+                                    updateToolbarState();
+                                } else if (e.key === 'i' || e.key === 'I') {
+                                    e.preventDefault();
+                                    document.execCommand('italic', false, null);
+                                    updateToolbarState();
+                                } else if (e.key === 'u' || e.key === 'U') {
+                                    e.preventDefault();
+                                    document.execCommand('underline', false, null);
+                                    updateToolbarState();
+                                }
+                            }
                         }
                     });
 
@@ -651,7 +677,7 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>HWPX Viewer</title>
+            <title>HWPX Viewer for VS Code</title>
             <style>
                 body {
                     font-family: var(--vscode-font-family);

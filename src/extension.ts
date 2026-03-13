@@ -9,7 +9,7 @@ export function getApiServer(): HwpxApiServer | null {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-    console.log('HWPX Viewer extension is now active!');
+    console.log('HWPX Viewer for VS Code is now active!');
 
     // Start API server
     apiServer = new HwpxApiServer();
