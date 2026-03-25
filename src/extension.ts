@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { HwpxEditorProvider } from './hwpxEditorProvider';
 import { HwpxApiServer } from './hwpxApiServer';
+import { writeInstructionFile } from './llmInstructions';
 
 let apiServer: HwpxApiServer | null = null;
 
@@ -37,7 +38,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 const helpUrl = `http://127.0.0.1:${apiServer?.getPort()}/api/help`;
                 await vscode.env.clipboard.writeText(helpUrl);
                 vscode.window.showInformationMessage(`Copied: ${helpUrl}`);
-            })
+            }),
+            vscode.commands.registerCommand('hwpx.generateClaudeInstructions', () => writeInstructionFile('claude', apiServer?.getPort(), apiServer?.getToken())),
+            vscode.commands.registerCommand('hwpx.generateCodexInstructions', () => writeInstructionFile('codex', apiServer?.getPort(), apiServer?.getToken())),
+            vscode.commands.registerCommand('hwpx.generateAntigravityInstructions', () => writeInstructionFile('antigravity', apiServer?.getPort(), apiServer?.getToken())),
+            vscode.commands.registerCommand('hwpx.generateCursorInstructions', () => writeInstructionFile('cursor', apiServer?.getPort(), apiServer?.getToken())),
+            vscode.commands.registerCommand('hwpx.generateKiroInstructions', () => writeInstructionFile('kiro', apiServer?.getPort(), apiServer?.getToken()))
         );
     } catch (err: any) {
         console.error('Failed to start HWPX API server:', err);

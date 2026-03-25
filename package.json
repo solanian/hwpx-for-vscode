@@ -44,6 +44,26 @@
       {
         "command": "hwpx.copyApiHelp",
         "title": "HWPX: Copy API Help URL"
+      },
+      {
+        "command": "hwpx.generateClaudeInstructions",
+        "title": "HWPX: Generate Claude Code Instructions (CLAUDE.md)"
+      },
+      {
+        "command": "hwpx.generateCodexInstructions",
+        "title": "HWPX: Generate Codex Instructions (AGENTS.md)"
+      },
+      {
+        "command": "hwpx.generateAntigravityInstructions",
+        "title": "HWPX: Generate Antigravity Instructions (ANTIGRAVITY.md)"
+      },
+      {
+        "command": "hwpx.generateCursorInstructions",
+        "title": "HWPX: Generate Cursor Instructions (.cursorrules)"
+      },
+      {
+        "command": "hwpx.generateKiroInstructions",
+        "title": "HWPX: Generate Kiro Instructions (.kiro/rules/hwpx-api.md)"
       }
     ],
     "customEditors": [
@@ -61,6 +81,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
+    "webpack": "webpack --mode production --devtool hidden-source-map",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "webpack --mode production --devtool hidden-source-map",
@@ -69,16 +90,17 @@
     "test": "tsc -p tsconfig.test.json && node out-test/test/apiServer.test.js"
   },
   "devDependencies": {
+    "@types/jszip": "^3.4.1",
     "@types/node": "20.x",
     "@types/vscode": "^1.85.0",
-    "@types/jszip": "^3.4.1",
+    "playwright": "^1.58.2",
+    "ts-loader": "^9.5.1",
     "typescript": "^5.3.3",
     "webpack": "^5.89.0",
-    "webpack-cli": "^5.1.4",
-    "ts-loader": "^9.5.1"
+    "webpack-cli": "^5.1.4"
   },
   "dependencies": {
-    "jszip": "^3.10.1",
-    "fast-xml-parser": "^4.3.5"
+    "fast-xml-parser": "^4.3.5",
+    "jszip": "^3.10.1"
   }
 }

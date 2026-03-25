@@ -44,6 +44,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import JSZip from 'jszip';
 import { HwpxApiServer } from '../src/hwpxApiServer';
+import { HwpxParser } from '../src/hwpxParser';
+import { generateInstructions, getTargetFileName, LlmTarget } from '../src/llmInstructions';
 
 // --- Test helpers ---
 
@@ -78,6 +80,30 @@ function assertIncludes(str: string, substr: string, msg: string) {
     if (!str || !str.includes(substr)) {
         failed++;
         const detail = `${msg} — "${substr}" not found in response`;
+        errors.push(`FAIL: ${detail}`);
+        console.error(`  ✗ ${detail}`);
+    } else {
+        passed++;
+        console.log(`  ✓ ${msg}`);
+    }
+}
+
+function assertNotIncludes(str: string, substr: string, msg: string) {
+    if (str && str.includes(substr)) {
+        failed++;
+        const detail = `${msg} — "${substr}" should NOT be found in response`;
+        errors.push(`FAIL: ${detail}`);
+        console.error(`  ✗ ${detail}`);
+    } else {
+        passed++;
+        console.log(`  ✓ ${msg}`);
+    }
+}
+
+function assertMatch(str: string, re: RegExp, msg: string) {
+    if (!str || !re.test(str)) {
+        failed++;
+        const detail = `${msg} — pattern ${re} not matched`;
         errors.push(`FAIL: ${detail}`);
         console.error(`  ✗ ${detail}`);
     } else {
@@ -171,9 +197,9 @@ function createMockZip(): JSZip {
 </hp:sec>`);
     zip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
-  <hh:mappingTable>
+  <hh:refList>
     <hh:charPr id="0" height="1000"/>
-  </hh:mappingTable>
+  </hh:refList>
 </hh:head>`);
     return zip;
 }
@@ -849,6 +875,571 @@ async function runTests() {
         assertIncludes(res.body, `127.0.0.1:${port}`, 'help: includes actual port');
         assertIncludes(res.body, '/test/doc.hwpx', 'help: lists open documents');
     }
+
+    // ============================================================
+    // Webview HTML / Editor Provider Tests
+    // ============================================================
+    {
+        console.log('\n--- Webview HTML generation tests ---');
+
+        // 1. 컴파일된 hwpxEditorProvider.js에서 템플릿 리터럴 내 JS 문법 검증
+        const editorJsPath = path.resolve(__dirname, '../../out/hwpxEditorProvider.js');
+        const editorJs = fs.readFileSync(editorJsPath, 'utf-8');
+
+        // 1a. \\n 이스케이프 검증: 생성된 JS 내 lastIndexOf/indexOf에서 개행이 아닌 \n 문자열이어야 함
+        // 컴파일된 JS에서 lastIndexOf('\\n' 패턴이 존재해야 함 (실제 백슬래시+n)
+        // tsc 출력에서는 '\\\\n'으로 이중 이스케이프됨
+        const hasEscapedNewline = editorJs.includes("lastIndexOf('\\\\n'") || editorJs.includes("lastIndexOf('\\n'");
+        assert(hasEscapedNewline, 'template literal: \\n is properly escaped in lastIndexOf (not raw newline)');
+
+        const hasEscapedNewlineIndexOf = editorJs.includes("indexOf('\\\\n'") || editorJs.includes("indexOf('\\n'");
+        assert(hasEscapedNewlineIndexOf, 'template literal: \\n is properly escaped in indexOf (not raw newline)');
+
+        // 1b. 잘못된 패턴 검출: lastIndexOf 안에 실제 개행이 들어가면 안됨
+        const brokenPattern = /lastIndexOf\(\s*'\s*\n/;
+        assert(!brokenPattern.test(editorJs), 'template literal: no raw newline inside lastIndexOf string literal');
+
+        const brokenPattern2 = /indexOf\(\s*'\s*\n/;
+        assert(!brokenPattern2.test(editorJs), 'template literal: no raw newline inside indexOf string literal');
+
+        // 2. 툴바 버튼 ID 존재 검증
+        assertIncludes(editorJs, 'tb-fontsize-down', 'toolbar: font size decrease button exists');
+        assertIncludes(editorJs, 'tb-fontsize-up', 'toolbar: font size increase button exists');
+        assertIncludes(editorJs, 'tb-ul', 'toolbar: bullet toggle button exists');
+
+        // 3. 폰트 크기 관련 함수 존재 검증
+        assertIncludes(editorJs, 'saveCurrentSelection', 'font size: saveCurrentSelection function exists');
+        assertIncludes(editorJs, 'applyFontSize', 'font size: applyFontSize function exists');
+        assertIncludes(editorJs, 'skipToolbarUpdate', 'font size: skipToolbarUpdate flag exists');
+        assertIncludes(editorJs, 'savedSelection', 'font size: savedSelection variable exists');
+
+        // 4. applyFontSize에서 execCommand fontSize 7 사용 검증
+        assertIncludes(editorJs, "fontSize", 'font size: uses fontSize command');
+        assertIncludes(editorJs, 'font[size=', 'font size: queries font[size] tags for replacement');
+
+        // 5. 연속 클릭: applyFontSize 후 savedSelection 재설정 검증
+        assertIncludes(editorJs, 'savedSelection = newRange.cloneRange()', 'font size: re-saves selection after apply for continuous clicks');
+
+        // 6. 글머리 기호 toggleBulletPrefix 함수 검증
+        assertIncludes(editorJs, 'toggleBulletPrefix', 'bullet: toggleBulletPrefix function exists');
+        assertIncludes(editorJs, "'- '", 'bullet: uses "- " as prefix (matches HWPX document style)');
+
+        // 7. 모드 버튼 이벤트 리스너 검증
+        assertIncludes(editorJs, 'hwpx-mode-view', 'mode bar: view button exists');
+        assertIncludes(editorJs, 'hwpx-mode-edit', 'mode bar: edit button exists');
+        assertIncludes(editorJs, 'hwpx-mode-select', 'mode bar: select button exists');
+        assertIncludes(editorJs, "setMode('view')", 'mode bar: view click handler exists');
+        assertIncludes(editorJs, "setMode('edit')", 'mode bar: edit click handler exists');
+        assertIncludes(editorJs, "setMode('select')", 'mode bar: select click handler exists');
+
+        // 8. try-catch 에러 핸들링 검증
+        assertIncludes(editorJs, 'catch(initErr)', 'error handling: try-catch wraps script initialization');
+
+        // 9. updateToolbarState에서 bullet 활성 상태 검증
+        assertIncludes(editorJs, 'bulletActive', 'toolbar state: bullet active state tracking exists');
+        assertIncludes(editorJs, "tb-ul", 'toolbar state: bullet button toggle exists');
+
+        // 10. package.json 검증
+        const pkgPath = path.resolve(__dirname, '../../package.json');
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+        assertEqual(pkg.publisher, 'muliphen', 'package.json: publisher is muliphen');
+        assertEqual(pkg.main, './out/extension.js', 'package.json: main points to out/extension.js');
+
+        // 11. JS 전체 문법 검증: script 블록 추출 후 new Function으로 파싱
+        // editorProvider의 getViewHtml 메서드에서 생성되는 <script> 블록을 추출
+        const scriptMatch = editorJs.match(/<script>\s*\(function\(\)\s*\{([\s\S]*?)\}\)\(\);\s*<\/script>/);
+        if (scriptMatch) {
+            let scriptBody = scriptMatch[1];
+            // acquireVsCodeApi 등 브라우저 전용 API를 스텁으로 교체하여 파싱만 검증
+            scriptBody = `
+                var acquireVsCodeApi = function() { return { postMessage: function(){} }; };
+                var document = {
+                    getElementById: function() { return { addEventListener: function(){}, classList: { toggle: function(){}, add: function(){}, remove: function(){} }, setAttribute: function(){}, getAttribute: function(){return '';}, style: {}, querySelectorAll: function(){return [];}, closest: function(){return null;}, textContent: '', firstChild: null, childNodes: [], querySelector: function(){return null;} }; },
+                    querySelectorAll: function() { return []; },
+                    querySelector: function() { return null; },
+                    addEventListener: function() {},
+                    execCommand: function() {},
+                    queryCommandState: function() { return false; },
+                    createRange: function() { return { selectNodeContents: function(){}, setStartBefore: function(){}, setEndAfter: function(){}, cloneRange: function(){ return {}; }, collapsed: true }; },
+                    createTreeWalker: function() { return { nextNode: function(){ return null; } }; },
+                    createElement: function() { return { style: {}, appendChild: function(){}, firstChild: null, lastChild: null }; },
+                    body: { prepend: function(){} },
+                    title: ''
+                };
+                var window = { getSelection: function() { return { rangeCount: 0, isCollapsed: true, anchorNode: null, anchorOffset: 0, removeAllRanges: function(){}, addRange: function(){}, getRangeAt: function(){ return { cloneRange: function(){ return {}; } }; }, collapse: function(){} }; }, addEventListener: function(){}, getComputedStyle: function(){ return { display: 'block', fontSize: '12px' }; } };
+                var navigator = { clipboard: { writeText: function() { return { then: function(cb){ cb(); return { catch: function(){} }; } }; } } };
+                var NodeFilter = { SHOW_TEXT: 4 };
+                var setTimeout = function(fn, ms) { return 0; };
+                var clearTimeout = function() {};
+                var Math = { min: function(a,b){ return a<b?a:b; }, max: function(a,b){ return a>b?a:b; }, round: function(x){ return x; } };
+                var parseInt = function(x){ return 12; };
+                var parseFloat = function(x){ return 12; };
+                ${scriptBody}
+            `;
+            try {
+                new Function(scriptBody);
+                assert(true, 'webview script: JS syntax is valid (parseable by new Function)');
+            } catch (syntaxErr: any) {
+                assert(false, `webview script: JS syntax error — ${syntaxErr.message}`);
+            }
+        } else {
+            assert(false, 'webview script: could not extract script block from compiled output');
+        }
+    }
+
+    // ============================================================
+    // HwpxParser output tests
+    // ============================================================
+    {
+        console.log('\n--- HwpxParser webview output tests ---');
+
+        const zip = createMockZip();
+        const result = await HwpxParser.parse(zip);
+
+        // 기본 HTML 출력 검증
+        assert(typeof result.html === 'string' && result.html.length > 0, 'parser: generates HTML output');
+        assert(typeof result.css === 'string', 'parser: generates CSS output');
+        assertIncludes(result.html, '안녕하세요 테스트입니다', 'parser: contains test text');
+        assertIncludes(result.html, '두번째 문단', 'parser: contains second paragraph');
+    }
+
+    // ============================================================
+    // 페이지 방향 (landscape) 테스트
+    // ============================================================
+    {
+        console.log('\n--- Page orientation tests ---');
+
+        // portrait 문서 (width < height, landscape 없음) → 세로로 렌더링
+        const portraitZip = new JSZip();
+        portraitZip.file('mimetype', 'application/hwp+zip');
+        portraitZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Portrait test</opf:title></opf:metadata>
+</opf:package>`);
+        portraitZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p><hp:run><hp:t>Portrait test</hp:t></hp:run></hp:p>
+  <hp:secPr>
+    <hp:pagePr width="59528" height="84188" gutterType="LEFT_ONLY">
+      <hp:margin header="4252" footer="4252" gutter="0" left="8504" right="8504" top="5668" bottom="4252"/>
+    </hp:pagePr>
+  </hp:secPr>
+</hp:sec>`);
+        portraitZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const portraitResult = await HwpxParser.parse(portraitZip);
+        // width=59528 ≈ 210mm, height=84188 ≈ 297mm, landscape 없음 → portrait
+        const widthMatch = portraitResult.html.match(/data-width="([\d.]+)"/);
+        const heightMatch = portraitResult.html.match(/data-height="([\d.]+)"/);
+        if (widthMatch && heightMatch) {
+            const w = parseFloat(widthMatch[1]);
+            const h = parseFloat(heightMatch[1]);
+            assert(w < h, `orientation: portrait document renders portrait (w=${w.toFixed(1)} < h=${h.toFixed(1)})`);
+        } else {
+            assert(false, 'orientation: could not extract page dimensions from HTML');
+        }
+
+        // landscape="WIDELY" + width < height → 세로(portrait), swap 안 함
+        const widelyZip = new JSZip();
+        widelyZip.file('mimetype', 'application/hwp+zip');
+        widelyZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Widely test</opf:title></opf:metadata>
+</opf:package>`);
+        widelyZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p><hp:run><hp:t>Widely test</hp:t></hp:run></hp:p>
+  <hp:secPr>
+    <hp:pagePr landscape="WIDELY" width="59528" height="84188" gutterType="LEFT_ONLY">
+      <hp:margin header="4252" footer="4252" gutter="0" left="8504" right="8504" top="5668" bottom="4252"/>
+    </hp:pagePr>
+  </hp:secPr>
+</hp:sec>`);
+        widelyZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const widelyResult = await HwpxParser.parse(widelyZip);
+        const widelyW = widelyResult.html.match(/data-width="([\d.]+)"/);
+        const widelyH = widelyResult.html.match(/data-height="([\d.]+)"/);
+        if (widelyW && widelyH) {
+            const w = parseFloat(widelyW[1]);
+            const h = parseFloat(widelyH[1]);
+            assert(w < h, `orientation: WIDELY is portrait, no swap (w=${w.toFixed(1)} < h=${h.toFixed(1)})`);
+        } else {
+            assert(false, 'orientation: could not extract WIDELY page dimensions');
+        }
+
+        // landscape 문서 (width > height) → 가로로 렌더링
+        const landscapeZip = new JSZip();
+        landscapeZip.file('mimetype', 'application/hwp+zip');
+        landscapeZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Landscape test</opf:title></opf:metadata>
+</opf:package>`);
+        landscapeZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p><hp:run><hp:t>Landscape test</hp:t></hp:run></hp:p>
+  <hp:secPr>
+    <hp:pagePr landscape="WIDELY" width="84188" height="59528" gutterType="LEFT_ONLY">
+      <hp:margin header="4252" footer="4252" gutter="0" left="8504" right="8504" top="5668" bottom="4252"/>
+    </hp:pagePr>
+  </hp:secPr>
+</hp:sec>`);
+        landscapeZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const landscapeResult = await HwpxParser.parse(landscapeZip);
+        const lwMatch = landscapeResult.html.match(/data-width="([\d.]+)"/);
+        const lhMatch = landscapeResult.html.match(/data-height="([\d.]+)"/);
+        if (lwMatch && lhMatch) {
+            const w = parseFloat(lwMatch[1]);
+            const h = parseFloat(lhMatch[1]);
+            assert(w > h, `orientation: landscape document renders landscape (w=${w.toFixed(1)} > h=${h.toFixed(1)})`);
+        } else {
+            assert(false, 'orientation: could not extract landscape page dimensions');
+        }
+
+        // landscape="NARROWLY" + width < height → swap하여 가로로 렌더링
+        const narrowlyZip = new JSZip();
+        narrowlyZip.file('mimetype', 'application/hwp+zip');
+        narrowlyZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Narrowly test</opf:title></opf:metadata>
+</opf:package>`);
+        narrowlyZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p><hp:run><hp:t>Narrowly test</hp:t></hp:run></hp:p>
+  <hp:secPr>
+    <hp:pagePr landscape="NARROWLY" width="59528" height="84189" gutterType="LEFT_ONLY">
+      <hp:margin header="4252" footer="4252" gutter="0" left="8504" right="8504" top="5668" bottom="4252"/>
+    </hp:pagePr>
+  </hp:secPr>
+</hp:sec>`);
+        narrowlyZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const narrowlyResult = await HwpxParser.parse(narrowlyZip);
+        const nwMatch = narrowlyResult.html.match(/data-width="([\d.]+)"/);
+        const nhMatch = narrowlyResult.html.match(/data-height="([\d.]+)"/);
+        if (nwMatch && nhMatch) {
+            const w = parseFloat(nwMatch[1]);
+            const h = parseFloat(nhMatch[1]);
+            assert(w > h, `orientation: NARROWLY with portrait dims swaps to landscape (w=${w.toFixed(1)} > h=${h.toFixed(1)})`);
+        } else {
+            assert(false, 'orientation: could not extract NARROWLY page dimensions');
+        }
+    }
+
+    // ============================================================
+    // 숫자 글머리 표 내 카운터 리셋 테스트
+    // ============================================================
+    {
+        console.log('\n--- Numbered bullet table counter tests ---');
+
+        const bulletZip = new JSZip();
+        bulletZip.file('mimetype', 'application/hwp+zip');
+        bulletZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Bullet test</opf:title></opf:metadata>
+</opf:package>`);
+        bulletZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="10" styleIDRef="0">
+    <hp:run charPrIDRef="0"><hp:t>Numbered paragraph</hp:t></hp:run>
+  </hp:p>
+</hp:sec>`);
+        bulletZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"
+         xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hh:refList>
+    <hh:charPr id="0" height="1000"/>
+    <hh:charProperties><hh:charPr id="0" height="1000"/></hh:charProperties>
+    <hh:paraProperties>
+      <hh:paraPr id="10">
+        <hh:heading type="NUMBER" idRef="1" level="0"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+    <hh:numberings>
+      <hh:numbering id="1">
+        <hh:paraHead level="0" start="1" numFormat="DIGIT">
+          <hc:valueType>STRING</hc:valueType>
+        </hh:paraHead>
+      </hh:numbering>
+    </hh:numberings>
+  </hh:refList>
+</hh:head>`);
+
+        const bulletResult = await HwpxParser.parse(bulletZip);
+
+        // 숫자 글머리는 CSS counter 대신 인라인 HTML로 생성
+        assertNotIncludes(bulletResult.css, 'counter-increment', 'bullet: no CSS counter-increment (inline HTML approach)');
+        assertNotIncludes(bulletResult.css, '::before', 'bullet: no ::before pseudo-element for numbering');
+        // HTML에 번호가 직접 포함되어야 함
+        assertIncludes(bulletResult.html, '>1. </span>', 'bullet: number prefix generated as inline HTML');
+    }
+
+    // ============================================================
+    // 페이지 나눔 (pageBreak="1") 테스트
+    // ============================================================
+    {
+        console.log('\n--- Page break (pageBreak="1") tests ---');
+
+        const pbZip = new JSZip();
+        pbZip.file('mimetype', 'application/hwp+zip');
+        pbZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>PageBreak test</opf:title></opf:metadata>
+</opf:package>`);
+        pbZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p id="0" paraPrIDRef="0" pageBreak="0">
+    <hp:run charPrIDRef="0"><hp:t>Before page break</hp:t></hp:run>
+  </hp:p>
+  <hp:p id="0" paraPrIDRef="0" pageBreak="1">
+    <hp:run charPrIDRef="0"><hp:t>After page break</hp:t></hp:run>
+  </hp:p>
+</hp:sec>`);
+        pbZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const pbResult = await HwpxParser.parse(pbZip);
+
+        // pageBreak="1"인 문단에 data-page-break="1" 속성 부여
+        assertIncludes(pbResult.html, 'data-page-break="1"', 'pageBreak: paragraph with pageBreak="1" has data attribute');
+
+        // pageBreak="0"인 문단에는 data-page-break 없음
+        const beforeBreakDiv = pbResult.html.split('Before page break')[0];
+        assertNotIncludes(beforeBreakDiv, 'data-page-break', 'pageBreak: paragraph with pageBreak="0" has no data attribute');
+
+        // "After page break" 텍스트를 포함하는 div에 data-page-break="1"이 있는지 확인
+        const afterBreakMatch = pbResult.html.match(/<div[^>]*data-page-break="1"[^>]*>.*?After page break/s);
+        assert(afterBreakMatch !== null, 'pageBreak: data-page-break="1" is on the correct paragraph');
+    }
+
+    // ============================================================
+    // paraPr breakSetting pageBreakBefore 테스트
+    // ============================================================
+    {
+        console.log('\n--- paraPr breakSetting pageBreakBefore tests ---');
+
+        const bsZip = new JSZip();
+        bsZip.file('mimetype', 'application/hwp+zip');
+        bsZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>BreakSetting test</opf:title></opf:metadata>
+</opf:package>`);
+        bsZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="0"><hp:run charPrIDRef="0"><hp:t>Normal paragraph</hp:t></hp:run></hp:p>
+  <hp:p paraPrIDRef="20"><hp:run charPrIDRef="0"><hp:t>Page break via paraPr</hp:t></hp:run></hp:p>
+</hp:sec>`);
+        bsZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:charPr id="0" height="1000"/>
+    <hh:charProperties><hh:charPr id="0" height="1000"/></hh:charProperties>
+    <hh:paraProperties>
+      <hh:paraPr id="0"/>
+      <hh:paraPr id="20">
+        <hh:breakSetting pageBreakBefore="1"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+  </hh:refList>
+</hh:head>`);
+
+        const bsResult = await HwpxParser.parse(bsZip);
+
+        // paraPr에 breakSetting pageBreakBefore="1"이 있는 문단(paraPrIDRef=20)에 data-page-break="1"
+        const bsParaMatch = bsResult.html.match(/<div[^>]*data-page-break="1"[^>]*>.*?Page break via paraPr/s);
+        assert(bsParaMatch !== null, 'breakSetting: paraPr pageBreakBefore generates data-page-break attribute');
+
+        // paraPrIDRef=0인 문단에는 data-page-break 없음
+        const normalMatch = bsResult.html.match(/<div[^>]*class="para-0"[^>]*>/);
+        if (normalMatch) {
+            assertNotIncludes(normalMatch[0], 'data-page-break', 'breakSetting: normal paragraph has no page break attribute');
+        } else {
+            assert(true, 'breakSetting: normal paragraph rendered (no page break)');
+        }
+    }
+
+    // ============================================================
+    // PUA 문자 불릿 처리 테스트
+    // ============================================================
+    {
+        console.log('\n--- PUA character bullet tests ---');
+
+        const puaZip = new JSZip();
+        puaZip.file('mimetype', 'application/hwp+zip');
+        puaZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>PUA test</opf:title></opf:metadata>
+</opf:package>`);
+        puaZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="30" styleIDRef="0">
+    <hp:run charPrIDRef="0"><hp:t>PUA bullet text</hp:t></hp:run>
+  </hp:p>
+  <hp:p paraPrIDRef="31" styleIDRef="0">
+    <hp:run charPrIDRef="0"><hp:t>Dash bullet text</hp:t></hp:run>
+  </hp:p>
+</hp:sec>`);
+        // PUA char: U+F09F (in Private Use Area 0xE000-0xF8FF)
+        const puaChar = String.fromCharCode(0xF09F);
+        puaZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:charPr id="0" height="1000"/>
+    <hh:charProperties><hh:charPr id="0" height="1000"/></hh:charProperties>
+    <hh:paraProperties>
+      <hh:paraPr id="30">
+        <hh:heading type="BULLET" idRef="1" level="0"/>
+      </hh:paraPr>
+      <hh:paraPr id="31">
+        <hh:heading type="BULLET" idRef="2" level="0"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+    <hh:bullets>
+      <hh:bullet id="1" char="${puaChar}"/>
+      <hh:bullet id="2" char="-"/>
+    </hh:bullets>
+  </hh:refList>
+</hh:head>`);
+
+        const puaResult = await HwpxParser.parse(puaZip);
+
+        // PUA 문자 불릿은 ● (U+25CF)로 대체 렌더링 (non-breaking space)
+        assertIncludes(puaResult.html, '>\u25CF\u00a0</span>', 'pua: PUA char rendered as filled circle bullet');
+        // 일반 문자 불릿('-')은 인라인 HTML로 표시
+        assertIncludes(puaResult.html, '>- </span>', 'pua: normal dash bullet rendered as inline HTML');
+    }
+
+    // ============================================================
+    // 표 셀 overflow: hidden 테스트
+    // ============================================================
+    {
+        console.log('\n--- Table cell overflow tests ---');
+
+        const tblZip = new JSZip();
+        tblZip.file('mimetype', 'application/hwp+zip');
+        tblZip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf">
+  <opf:metadata><opf:title>Table test</opf:title></opf:metadata>
+</opf:package>`);
+        tblZip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p>
+    <hp:run>
+      <hp:tbl pageBreak="CELL" repeatHeader="0" rowCnt="1" colCnt="1" cellSpacing="0" borderFillIDRef="0">
+        <hp:tr>
+          <hp:tc>
+            <hp:subList vertAlign="CENTER">
+              <hp:p paraPrIDRef="0"><hp:run charPrIDRef="0"><hp:t>Cell text</hp:t></hp:run></hp:p>
+            </hp:subList>
+            <hp:cellAddr colAddr="0" rowAddr="0"/>
+            <hp:cellSpan colSpan="1" rowSpan="1"/>
+            <hp:cellSz width="5000" height="1000"/>
+            <hp:cellMargin left="100" right="100" top="100" bottom="100"/>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    </hp:run>
+  </hp:p>
+</hp:sec>`);
+        tblZip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList><hh:charPr id="0" height="1000"/></hh:refList>
+</hh:head>`);
+
+        const tblResult = await HwpxParser.parse(tblZip);
+
+        // td에 overflow: hidden 스타일이 적용되는지 확인
+        assertIncludes(tblResult.html, 'overflow: hidden', 'table: td has overflow: hidden style');
+
+        // vertAlign="CENTER" → vertical-align: middle 확인
+        assertIncludes(tblResult.html, 'vertical-align: middle', 'table: vertAlign CENTER maps to vertical-align middle');
+    }
+
+    // ============================================================
+    // LLM Instruction Generation
+    // ============================================================
+    console.log('\n--- LLM Instruction Generation ---');
+
+    // Target file names
+    assertEqual(getTargetFileName('claude'), 'CLAUDE.md', 'llm: claude target file is CLAUDE.md');
+    assertEqual(getTargetFileName('codex'), 'AGENTS.md', 'llm: codex target file is AGENTS.md');
+    assertEqual(getTargetFileName('antigravity'), 'ANTIGRAVITY.md', 'llm: antigravity target file is ANTIGRAVITY.md');
+    assertEqual(getTargetFileName('cursor'), '.cursorrules', 'llm: cursor target file is .cursorrules');
+    assertEqual(getTargetFileName('kiro'), '.kiro/rules/hwpx-api.md', 'llm: kiro target file is .kiro/rules/hwpx-api.md');
+
+    // Each target generates non-empty content with required sections
+    const targets: LlmTarget[] = ['claude', 'codex', 'antigravity', 'cursor', 'kiro'];
+    for (const target of targets) {
+        const content = generateInstructions(target);
+        assert(content.length > 0, `llm(${target}): generates non-empty content`);
+        assertIncludes(content, '/api/documents', `llm(${target}): includes /api/documents endpoint`);
+        assertIncludes(content, '/api/element', `llm(${target}): includes /api/element endpoint`);
+        assertIncludes(content, '/api/save', `llm(${target}): includes /api/save endpoint`);
+        assertIncludes(content, '/api/xml', `llm(${target}): includes /api/xml endpoint`);
+        assertIncludes(content, '/api/help', `llm(${target}): includes /api/help endpoint`);
+        assertIncludes(content, '/api/reload', `llm(${target}): includes /api/reload endpoint`);
+        assertIncludes(content, '/api/files', `llm(${target}): includes /api/files endpoint`);
+        assertIncludes(content, 'Authorization: Bearer', `llm(${target}): includes auth instructions`);
+        assertIncludes(content, 'XPath', `llm(${target}): includes XPath documentation`);
+        assertIncludes(content, 'hp:p', `llm(${target}): includes HWPX element examples`);
+        assertIncludes(content, 'Select', `llm(${target}): includes Select mode info`);
+        assertIncludes(content, 'curl', `llm(${target}): includes curl examples`);
+    }
+
+    // Claude-specific content
+    const claudeContent = generateInstructions('claude');
+    assertIncludes(claudeContent, 'Claude Code', 'llm(claude): includes Claude Code name');
+    assertIncludes(claudeContent, 'Bash tool', 'llm(claude): includes Bash tool tip');
+
+    // Codex-specific content
+    const codexContent = generateInstructions('codex');
+    assertIncludes(codexContent, 'Codex', 'llm(codex): includes Codex name');
+
+    // Antigravity-specific content
+    const antiContent = generateInstructions('antigravity');
+    assertIncludes(antiContent, 'Antigravity', 'llm(antigravity): includes Antigravity name');
+
+    // Cursor-specific content
+    const cursorContent = generateInstructions('cursor');
+    assertIncludes(cursorContent, 'Cursor', 'llm(cursor): includes Cursor name');
+
+    // Kiro-specific content
+    const kiroContent = generateInstructions('kiro');
+    assertIncludes(kiroContent, 'Kiro', 'llm(kiro): includes Kiro name');
+
+    // Port/token reconnection note
+    const noteContent = generateInstructions('claude', 12345, 'tok');
+    assertIncludes(noteContent, 'port and token change', 'llm: includes port/token refresh note');
+
+    // Port/token injection
+    const injected = generateInstructions('claude', 12345, 'mytoken123');
+    assertIncludes(injected, '12345', 'llm: injected port appears in output');
+    assertIncludes(injected, 'mytoken123', 'llm: injected token appears in output');
+    assertIncludes(injected, 'http://127.0.0.1:12345', 'llm: injected base URL is correct');
+    assertIncludes(injected, 'Bearer mytoken123', 'llm: injected token in auth header example');
+    assertNotIncludes(injected, '<PORT>', 'llm: no <PORT> placeholder when port provided');
+    assertNotIncludes(injected, '<TOKEN>', 'llm: no <TOKEN> placeholder when token provided');
+
+    // Fallback placeholders when no port/token
+    const fallback = generateInstructions('codex');
+    assertIncludes(fallback, '<PORT>', 'llm: <PORT> placeholder when port not provided');
+    assertIncludes(fallback, '<TOKEN>', 'llm: <TOKEN> placeholder when token not provided');
 
     // ============================================================
     // Done

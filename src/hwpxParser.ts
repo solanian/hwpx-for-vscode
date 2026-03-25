@@ -39,8 +39,15 @@ export class HwpxParser {
     private static autoNumCounters: Record<string, number> = {};
     // styleMap: { id -> { paraPrIDRef, charPrIDRef, type } }
     private static styleMap: Record<string, { paraPrIDRef: string; charPrIDRef: string; type: string }> = {};
+    private static pageBreakParaIds: Set<string> = new Set();
     // tabPrMap: { id -> TabItem[] }
     private static tabPrMap: Record<string, { pos: number; type: string; leader: string }[]> = {};
+    // headingMap: { paraPrId -> { type, bulletChar, numFormat, idRef, level, autoIndent } }
+    private static headingMap: Record<string, { type: string; bulletChar?: string; numFormat?: string; idRef: string; level: number; autoIndent?: boolean }> = {};
+    // numCounters: { counterKey -> currentValue } — 번호 매기기 카운터 (셀 진입 시 리셋)
+    private static numCounters: Record<string, number> = {};
+    // 큰 이미지 지연 로딩 배열 (Chromium 테이블 파싱 문제 회피)
+    private static deferredImages: string[] = [];
 
     static async parse(zip: any): Promise<ParseResult> {
         const result: ParseResult = {
@@ -54,9 +61,12 @@ export class HwpxParser {
         this.autoNumCounters = {};
         this.styleMap = {};
         this.tabPrMap = {};
+        this.headingMap = {};
 
         // 이미지 바이너리 맵 (id -> data URI)
         const imageMap: Record<string, string> = {};
+        // 큰 이미지를 지연 로딩하기 위한 배열 (Chromium이 큰 inline base64를 테이블 내에서 파싱 실패하는 문제 회피)
+        this.deferredImages = [];
 
         const parser = new XMLParser({
             ignoreAttributes: false,
@@ -123,6 +133,8 @@ export class HwpxParser {
         }
 
         let defaultPageCss = `width: 210mm; min-height: 297mm; padding: 30mm 20mm; box-sizing: border-box; position: relative; overflow: hidden;`;
+        let defaultPageWidthMm = 210;
+        let defaultPageHeightMm = 297;
 
         // 2. 스타일(header.xml) 파싱
         try {
@@ -138,14 +150,10 @@ export class HwpxParser {
                     if (pageDef) {
                         let widthMm = parseInt(pageDef['@_width'] || '59528') / 283.465;
                         let heightMm = parseInt(pageDef['@_height'] || '84188') / 283.465;
-                        const landscapeVal = String(pageDef['@_landscape'] || '').trim().toLowerCase();
-                        // landscape 속성이 있으면 (NARROWLY/WIDELY 등) 가로 방향
-                        const isLandscape = landscapeVal !== '' && landscapeVal !== '0' && landscapeVal !== 'false' && landscapeVal !== 'undefined';
-
-                        if (isLandscape && widthMm < heightMm) {
-                            const temp = widthMm;
-                            widthMm = heightMm;
-                            heightMm = temp;
+                        // landscape="NARROWLY"이면 가로 방향 → width < height일 때 swap (WIDELY는 세로)
+                        const landscape = pageDef['@_landscape'];
+                        if (landscape === 'NARROWLY' && widthMm < heightMm) {
+                            [widthMm, heightMm] = [heightMm, widthMm];
                         }
 
                         const marginTag = pageDef['hh:pageMar'] || pageDef['hp:pageMar'] || pageDef['hh:margin'] || pageDef['hp:margin'];
@@ -160,6 +168,8 @@ export class HwpxParser {
                         }
 
                         defaultPageCss = `width: ${widthMm}mm; min-height: ${heightMm}mm; ${paddingCss} box-sizing: border-box; position: relative; overflow: hidden;`;
+                        defaultPageWidthMm = widthMm;
+                        defaultPageHeightMm = heightMm;
                     }
                 }
 
@@ -306,11 +316,11 @@ export class HwpxParser {
                         const bullets = Array.isArray(bulletDefs['hh:bullet']) ? bulletDefs['hh:bullet'] : (bulletDefs['hh:bullet'] ? [bulletDefs['hh:bullet']] : []);
                         for (const b of bullets) {
                             const bid = b['@_id'];
-                            let bchar = b['@_char'] || '•';
+                            let bchar = b['@_char'] ?? '';
+                            // PUA(Private Use Area) 문자는 한/글 전용 글리프 — 기본 불릿(●)으로 대체
                             if (bchar && bchar.charCodeAt(0) >= 0xE000 && bchar.charCodeAt(0) <= 0xF8FF) {
-                                bchar = '•';
+                                bchar = '\u25CF'; // ●
                             }
-                            bchar = bchar || '•';
                             // paraHead의 autoIndent 속성 추출
                             const paraHeads = Array.isArray(b['hh:paraHead']) ? b['hh:paraHead'] : (b['hh:paraHead'] ? [b['hh:paraHead']] : []);
                             const autoIndent = paraHeads.length > 0 && (paraHeads[0]['@_autoIndent'] === '1' || paraHeads[0]['@_autoIndent'] === 'true');
@@ -429,6 +439,7 @@ export class HwpxParser {
                     }
 
                     // ===== paraPr CSS 생성 =====
+                    this.pageBreakParaIds = new Set(); // pageBreakBefore가 있는 paraPr ID
                     const paraProps = refList['hh:paraProperties']?.['hh:paraPr'];
                     if (paraProps) {
                         for (const pp of paraProps) {
@@ -438,7 +449,10 @@ export class HwpxParser {
                             // 분할 설정 (breakSetting)
                             const breakSetting = pp['hh:breakSetting'];
                             if (breakSetting) {
-                                if (breakSetting['@_pageBreakBefore'] === '1') css += `break-before: page; `;
+                                if (breakSetting['@_pageBreakBefore'] === '1') {
+                                    css += `break-before: page; `;
+                                    this.pageBreakParaIds.add(String(id));
+                                }
                                 if (breakSetting['@_keepWithNext'] === '1') css += `break-after: avoid; `;
                                 if (breakSetting['@_widowOrphan'] === '1') css += `orphans: 2; widows: 2; `;
                             }
@@ -556,49 +570,33 @@ export class HwpxParser {
                                 }
                             }
 
-                            // 글머리 기호 (heading type=BULLET) — paraPr margin이 들여쓰기 처리
+                            // 글머리 기호 (heading type=BULLET)
                             const heading = pp['hh:heading'];
                             if (heading && heading['@_type'] === 'BULLET') {
                                 const idRef = heading['@_idRef'] || '1';
                                 const bulletInfo = bulletMap[idRef];
-                                const bulletChar = bulletInfo?.char || '•';
-                                const autoIndent = bulletInfo?.autoIndent ?? false;
-                                // autoIndent: 글머리 기호 뒤 텍스트 위치에 후속 줄 정렬 (hanging indent)
-                                if (autoIndent) {
-                                    css += `padding-left: 1.2em; text-indent: -1.2em; `;
+                                const bulletChar = bulletInfo?.char || '';
+                                if (bulletChar) {
+                                    const autoIndent = bulletInfo?.autoIndent || false;
+                                    this.headingMap[String(id)] = { type: 'BULLET', bulletChar, idRef, level: 0, autoIndent };
                                 }
                                 result.css += `.para-${id} { ${css} }\n`;
-                                result.css += `.para-${id}::before { content: '${bulletChar === '-' ? '- ' : bulletChar + '\\00a0'}'; }\n`;
                             }
-                            // 번호 매기기 (heading type=NUMBER) — paraPr margin이 들여쓰기 처리
+                            // 번호 매기기 (heading type=NUMBER)
                             else if (heading && heading['@_type'] === 'NUMBER') {
                                 const idRef = heading['@_idRef'] || '1';
                                 const level = parseInt(heading['@_level'] || '0') + 1;
-                                const counterName = `hwpx-num-${idRef}-${level}`;
                                 const levelInfo = this.numberingMap[idRef]?.[String(level)];
-                                let counterStyle = 'decimal';
-                                if (levelInfo) {
-                                    switch (levelInfo.numFormat) {
-                                        case 'HANGUL_SYLLABLE': counterStyle = 'korean-hangul-formal'; break;
-                                        case 'LATIN_UPPER': counterStyle = 'upper-latin'; break;
-                                        case 'LATIN_LOWER': counterStyle = 'lower-latin'; break;
-                                        case 'ROMAN_UPPER': counterStyle = 'upper-roman'; break;
-                                        case 'ROMAN_LOWER': counterStyle = 'lower-roman'; break;
-                                        default: counterStyle = 'decimal';
-                                    }
-                                    // autoIndent: 번호 뒤 텍스트 위치에 후속 줄 정렬
-                                    if (levelInfo.autoIndent) {
-                                        css += `padding-left: 1.6em; text-indent: -1.6em; `;
-                                    }
-                                }
-                                result.css += `.para-${id} { ${css} counter-increment: ${counterName}; }\n`;
-                                result.css += `.para-${id}::before { content: counter(${counterName}, ${counterStyle}) '. '; }\n`;
+                                const numFormat = levelInfo?.numFormat || 'DIGIT';
+                                this.headingMap[String(id)] = { type: 'NUMBER', numFormat, idRef, level };
+                                result.css += `.para-${id} { ${css} }\n`;
                             }
                             else {
                                 result.css += `.para-${id} { ${css} }\n`;
                             }
                         }
                     }
+                    // (numbering은 HTML 인라인 생성 방식으로 변경 — CSS counter 사용 안 함)
                     // ===== 스타일 정의 (hh:styles) =====
                     const styles = head['hh:styles'];
                     if (styles) {
@@ -646,7 +644,7 @@ export class HwpxParser {
                 const sectionObj = parser.parse(processedSectionXml);
 
                 let pageCss = defaultPageCss;
-                let pageDataAttrs = '';
+                let pageDataAttrs = `data-width="${defaultPageWidthMm}" data-height="${defaultPageHeightMm}"`;
 
                 let headerHtml = '';
                 let footerHtml = '';
@@ -660,14 +658,10 @@ export class HwpxParser {
                     const pagePr = secPrNode['hp:pagePr'];
                     let widthMm = parseInt(pagePr['@_width'] || '59528') / 283.465;
                     let heightMm = parseInt(pagePr['@_height'] || '84188') / 283.465;
-
-                    const landscapeVal = String(pagePr['@_landscape'] || '').trim().toLowerCase();
-                    // landscape 속성이 있으면 (NARROWLY/WIDELY 등) 가로 방향 — 실제 레이아웃 크기 우선
-                    const isLandscape = landscapeVal !== '' && landscapeVal !== '0' && landscapeVal !== 'false' && landscapeVal !== 'undefined';
-                    if (isLandscape && widthMm < heightMm) {
-                        const temp = widthMm;
-                        widthMm = heightMm;
-                        heightMm = temp;
+                    // landscape="NARROWLY"이면 가로 방향 → width < height일 때 swap (WIDELY는 세로)
+                    const landscape = pagePr['@_landscape'];
+                    if (landscape === 'NARROWLY' && widthMm < heightMm) {
+                        [widthMm, heightMm] = [heightMm, widthMm];
                     }
 
                     let paddingCss = '';
@@ -771,6 +765,8 @@ export class HwpxParser {
         result.html = htmlParts.join('\n');
 
         // 브라우저 렌더링 시점에 각 요소의 위치를 측정하여 페이지 분할하는 JS (표는 overflow clip 방식으로 행 중간에서도 분할)
+        // 지연 로딩 이미지 데이터를 pagination 스크립트 내에서 통합 처리 (Chromium 테이블 파싱 문제 회피)
+        const deferredJson = this.deferredImages.length > 0 ? JSON.stringify(this.deferredImages) : '[]';
         result.html += `
         <div id="hwpx-render-root"></div>
         <script>
@@ -778,6 +774,13 @@ export class HwpxParser {
                 const root = document.getElementById('hwpx-render-root');
                 const sections = document.querySelectorAll('.hwpx-section-container');
                 const mmToPx = (mm) => mm * 3.779527;
+
+                // 지연 로딩 이미지 할당 (큰 base64 data URI를 HTML에서 분리한 것을 복원)
+                var __hwpxDeferredImgs = ${deferredJson};
+                document.querySelectorAll('img[data-lazy-idx]').forEach(function(img) {
+                    var idx = parseInt(img.getAttribute('data-lazy-idx'));
+                    if (__hwpxDeferredImgs[idx]) { img.src = __hwpxDeferredImgs[idx]; img.removeAttribute('data-lazy-idx'); }
+                });
 
                 // 모든 이미지가 로드된 후 페이지네이션 실행
                 var allImgs = document.querySelectorAll('.hwpx-section-container img');
@@ -818,6 +821,7 @@ export class HwpxParser {
                     template.style.top = '0';
                     template.style.left = '-99999px';
                     document.body.appendChild(template);
+
 
                     const widthMm = parseFloat(section.getAttribute('data-width') || 210);
                     const heightMm = parseFloat(section.getAttribute('data-height') || 297);
@@ -882,6 +886,11 @@ export class HwpxParser {
 
                     for (let ci = 0; ci < children.length; ci++) {
                         const child = children[ci];
+
+                        // 페이지 나눔 (data-page-break="1") 처리
+                        if (child.getAttribute && child.getAttribute('data-page-break') === '1' && curPage.children.length > 0) {
+                            finalizePage();
+                        }
 
                         if (child.tagName === 'TABLE') {
                             // 테이블 분할: 실시간 측정 + 행/셀 내용 DOM 분리
@@ -953,46 +962,10 @@ export class HwpxParser {
                                         });
                                     }
 
-                                    // 블록(문단) 단위로 자식 노드를 하나씩 추가하며 높이 측정
-                                    var splitLevel = maxChildCount;
-                                    for (var level = 0; level < maxChildCount; level++) {
-                                        for (var ci4 = 0; ci4 < cells.length; ci4++) {
-                                            if (level < cellKids[ci4].length) {
-                                                tmpCells[ci4].appendChild(cellKids[ci4][level].cloneNode(true));
-                                            }
-                                        }
-                                        var h = tmpTr.getBoundingClientRect().height;
-                                        if (h > maxH) {
-                                            splitLevel = level;
-                                            break;
-                                        }
-                                    }
                                     measure.removeChild(tmpTbl);
 
-                                    // splitLevel > 0: 블록(문단) 경계에서 깔끔하게 분리
-                                    if (splitLevel > 0) {
-                                        var topTr = rowNode.cloneNode(false);
-                                        var bottomTr = rowNode.cloneNode(false);
-                                        for (var ci5 = 0; ci5 < cells.length; ci5++) {
-                                            var topCell = cells[ci5].cloneNode(false);
-                                            var bottomCell = cells[ci5].cloneNode(false);
-                                            topCell.style.height = 'auto';
-                                            bottomCell.style.height = 'auto';
-                                            for (var ki = 0; ki < cellKids[ci5].length; ki++) {
-                                                if (ki < splitLevel) {
-                                                    topCell.appendChild(cellKids[ci5][ki].cloneNode(true));
-                                                } else {
-                                                    bottomCell.appendChild(cellKids[ci5][ki].cloneNode(true));
-                                                }
-                                            }
-                                            topTr.appendChild(topCell);
-                                            bottomTr.appendChild(bottomCell);
-                                        }
-                                        return { topRow: topTr, bottomRow: bottomTr };
-                                    }
-
-                                    // splitLevel === 0: 첫 번째 자식(블록)만으로도 넘침
-                                    // → Range.getClientRects()로 실제 줄 위치를 측정하여 줄 경계에서 clip
+                                    // 셀별 독립 클리핑: 각 셀의 콘텐츠를 개별적으로 측정하여 줄 경계에서 clip
+                                    // (블록 레벨 동기 분할은 Cell[0]의 큰 이미지가 Cell[1]의 짧은 텍스트까지 밀어내는 문제가 있음)
 
                                     // 실제 줄 위치 측정을 위해 테이블 컨텍스트에서 렌더링
                                     var mTbl = tblRef.cloneNode(false);
@@ -1104,10 +1077,93 @@ export class HwpxParser {
                                     return { topRow: topTr2, bottomRow: bottomTr2 };
                                 }
 
+                                // rowspan 점유 맵 구축: 각 행에서 이전 행의 rowspan으로 점유된 컬럼 추적
+                                var rowspanCover = {}; // { bodyRowIdx: [{ col, colSpan, style, remainingSpan }] }
+                                for (var rsi = 0; rsi < bodyRows.length; rsi++) {
+                                    var rsTds = Array.from(bodyRows[rsi].querySelectorAll(':scope > td, :scope > th'));
+                                    var rsCol = 0;
+                                    // 컬럼 위치 계산 시 이전 행의 rowspan 점유 고려
+                                    for (var rsci = 0; rsci < rsTds.length; rsci++) {
+                                        // 현재 행에서 이전 rowspan이 점유한 컬럼 건너뛰기 (반복)
+                                        var skipAgain = true;
+                                        while (skipAgain && rowspanCover[rsi]) {
+                                            skipAgain = false;
+                                            for (var rsk = 0; rsk < rowspanCover[rsi].length; rsk++) {
+                                                if (rowspanCover[rsi][rsk].col === rsCol) {
+                                                    rsCol += rowspanCover[rsi][rsk].colSpan;
+                                                    skipAgain = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        var rsRS = parseInt(rsTds[rsci].getAttribute('rowspan') || '1');
+                                        var rsCS = parseInt(rsTds[rsci].getAttribute('colspan') || '1');
+                                        if (rsRS > 1) {
+                                            // 이 셀이 점유하는 아래 행들 기록
+                                            for (var rsR = rsi + 1; rsR < rsi + rsRS && rsR < bodyRows.length; rsR++) {
+                                                if (!rowspanCover[rsR]) rowspanCover[rsR] = [];
+                                                rowspanCover[rsR].push({
+                                                    col: rsCol,
+                                                    colSpan: rsCS,
+                                                    width: rsTds[rsci].style.width || '',
+                                                    sourceRowIdx: rsi,
+                                                    totalSpan: rsRS
+                                                });
+                                            }
+                                        }
+                                        rsCol += rsCS;
+                                    }
+                                }
+
+                                // 행에 rowspan placeholder 셀 삽입 (새 페이지에서 빈 셀 추가)
+                                function addRowspanPlaceholders(row, bodyRowIdx, pageFirstRowIdx) {
+                                    var covers = rowspanCover[bodyRowIdx];
+                                    if (!covers) return;
+                                    for (var pi = 0; pi < covers.length; pi++) {
+                                        var cover = covers[pi];
+                                        // 이 rowspan의 원본 행이 현재 페이지에 포함되어 있으면 placeholder 불필요
+                                        if (cover.sourceRowIdx >= pageFirstRowIdx) continue;
+                                        // 빈 placeholder 셀 삽입
+                                        var placeholder = document.createElement('td');
+                                        placeholder.setAttribute('colspan', String(cover.colSpan));
+                                        // 남은 행 수 계산: 원본 rowspan의 끝 행 - 현재 행
+                                        var endRow = cover.sourceRowIdx + cover.totalSpan;
+                                        var remaining = endRow - bodyRowIdx;
+                                        if (remaining > 1) placeholder.setAttribute('rowspan', String(remaining));
+                                        if (cover.width) placeholder.style.width = cover.width;
+                                        placeholder.style.borderLeft = '0.1mm solid #000';
+                                        placeholder.style.borderRight = '0.1mm solid #000';
+                                        placeholder.style.borderTop = 'none';
+                                        placeholder.style.borderBottom = 'none';
+                                        // 올바른 위치에 삽입 (col 순서대로)
+                                        var tds = Array.from(row.querySelectorAll(':scope > td, :scope > th'));
+                                        if (cover.col === 0) {
+                                            row.insertBefore(placeholder, row.firstChild);
+                                        } else if (tds.length > 0) {
+                                            // 단순히 앞에 삽입 (col 위치 기반)
+                                            var inserted = false;
+                                            var curCol = 0;
+                                            for (var ti = 0; ti < tds.length; ti++) {
+                                                if (curCol >= cover.col) {
+                                                    row.insertBefore(placeholder, tds[ti]);
+                                                    inserted = true;
+                                                    break;
+                                                }
+                                                curCol += parseInt(tds[ti].getAttribute('colspan') || '1');
+                                            }
+                                            if (!inserted) row.appendChild(placeholder);
+                                        } else {
+                                            row.appendChild(placeholder);
+                                        }
+                                    }
+                                }
+
                                 var rowIdx = 0;
                                 var isFirstTablePage = true;
                                 var pendingBottomRow = null;
+                                var pendingRowIdx = 0; // pending 행의 원래 bodyRow 인덱스
                                 var safety = 0;
+                                var pageFirstBodyRow = 0;
 
                                 while ((rowIdx < bodyRows.length || pendingBottomRow) && safety < 200) {
                                     safety++;
@@ -1126,7 +1182,11 @@ export class HwpxParser {
 
                                     // pending 행이 있으면 먼저 추가
                                     if (pendingBottomRow) {
-                                        liveTb.appendChild(pendingBottomRow.cloneNode(true));
+                                        var pendClone = pendingBottomRow.cloneNode(true);
+                                        if (!isFirstTablePage) {
+                                            addRowspanPlaceholders(pendClone, pendingRowIdx, pageFirstBodyRow);
+                                        }
+                                        liveTb.appendChild(pendClone);
                                         var newH = liveTbl.getBoundingClientRect().height;
                                         if (newH <= pageAvail + 0.5) {
                                             rowsAdded++;
@@ -1151,13 +1211,18 @@ export class HwpxParser {
                                             measure.innerHTML = '';
                                             curMaxH = contentMaxH;
                                             isFirstTablePage = false;
+                                            pageFirstBodyRow = rowIdx;
                                             continue;
                                         }
                                     }
 
                                     // 행을 하나씩 추가하며 실시간 측정
                                     while (rowIdx < bodyRows.length) {
-                                        liveTb.appendChild(bodyRows[rowIdx].cloneNode(true));
+                                        var clonedRow = bodyRows[rowIdx].cloneNode(true);
+                                        if (!isFirstTablePage && liveTb.children.length === 0) {
+                                            addRowspanPlaceholders(clonedRow, rowIdx, pageFirstBodyRow);
+                                        }
+                                        liveTb.appendChild(clonedRow);
                                         var curH = liveTbl.getBoundingClientRect().height;
                                         if (curH > pageAvail + 0.5) {
                                             // 이 행이 overflow → 제거 후 셀 내용 분리
@@ -1167,6 +1232,7 @@ export class HwpxParser {
                                                 var sp = splitRowAtHeight(child, origThead, bodyRows[rowIdx], spaceLeft);
                                                 liveTb.appendChild(sp.topRow);
                                                 pendingBottomRow = sp.bottomRow;
+                                                pendingRowIdx = rowIdx;
                                                 rowIdx++;
                                             }
                                             break;
@@ -1189,6 +1255,7 @@ export class HwpxParser {
                                         curPage = newPage();
                                         measure.innerHTML = '';
                                         curMaxH = contentMaxH;
+                                        pageFirstBodyRow = rowIdx;
                                     }
 
                                     isFirstTablePage = false;
@@ -1342,10 +1409,21 @@ export class HwpxParser {
 
                     html += `<table border="0"${dataRepeat} data-hwpx="${tblPath}" style="border-collapse: collapse; ${tableMargin} ${tableWidth} ${tableStyle}">`;
                     const trs = Array.isArray(t['hp:tr']) ? t['hp:tr'] : (t['hp:tr'] ? [t['hp:tr']] : []);
+                    // repeatHeader: 셀의 header 속성으로 헤더 행 수 계산
+                    let headerRowCount = 0;
+                    if (repeatHeader) {
+                        for (let ri = 0; ri < trs.length; ri++) {
+                            const rowCells = Array.isArray(trs[ri]['hp:tc']) ? trs[ri]['hp:tc'] : (trs[ri]['hp:tc'] ? [trs[ri]['hp:tc']] : []);
+                            const allHeader = rowCells.length > 0 && rowCells.every((c: any) => c['@_header'] === '1' || c['@_header'] === 'true');
+                            if (allHeader) headerRowCount = ri + 1;
+                            else break;
+                        }
+                    }
+                    let theadOpened = false;
                     for (let ri = 0; ri < trs.length; ri++) {
                         const tr = trs[ri];
                         const trPath = `${tblPath}/hp:tr[${ri}]`;
-                        if (ri === 0 && repeatHeader) html += `<thead>`;
+                        if (ri === 0 && headerRowCount > 0) { html += `<thead>`; theadOpened = true; }
                         html += `<tr data-hwpx="${trPath}">`;
                         const tcs = Array.isArray(tr['hp:tc']) ? tr['hp:tc'] : (tr['hp:tc'] ? [tr['hp:tc']] : []);
                         for (let ci = 0; ci < tcs.length; ci++) {
@@ -1402,7 +1480,9 @@ export class HwpxParser {
                                 else vAlign = 'top';
                             }
 
-                            html += `<td colspan="${colSpan}" rowspan="${rowSpan}" data-hwpx="${tcPath}" style="${cellPadding} ${borderCss} word-break: break-word; vertical-align: ${vAlign}; ${cellStyle} ${cellHeightStyle} ${bgColor}">`;
+                            html += `<td colspan="${colSpan}" rowspan="${rowSpan}" data-hwpx="${tcPath}" style="${cellPadding} ${borderCss} word-break: break-word; overflow: hidden; vertical-align: ${vAlign}; ${cellStyle} ${cellHeightStyle} ${bgColor}">`;
+                            // 셀 진입 시 번호 카운터 리셋
+                            this.numCounters = {};
                             if (subList) {
                                 html += this.extractHtml(subList, imageMap, `${tcPath}/hp:subList`);
                             } else {
@@ -1411,9 +1491,9 @@ export class HwpxParser {
                             html += `</td>`;
                         }
                         html += `</tr>`;
-                        if (ri === 0 && repeatHeader) html += `</thead><tbody>`;
+                        if (theadOpened && ri === headerRowCount - 1) { html += `</thead><tbody>`; theadOpened = false; }
                     }
-                    if (repeatHeader && trs.length > 0) html += `</tbody>`;
+                    if (headerRowCount > 0 && trs.length > headerRowCount) html += `</tbody>`;
                     html += `</table>`;
                 }
             }
@@ -1439,13 +1519,62 @@ export class HwpxParser {
                     const runs = Array.isArray(p['hp:run']) ? p['hp:run'] : (p['hp:run'] ? [p['hp:run']] : []);
                     const hasTbl = runs.some((r: any) => !!r['hp:tbl']);
 
+                    // hp:p 요소의 pageBreak 속성 또는 paraPr의 breakSetting pageBreakBefore
+                    const hasPageBreak = p['@_pageBreak'] === '1' || p['@_pageBreak'] === 1
+                        || (paraId !== '' && this.pageBreakParaIds.has(String(paraId)));
+                    const pageBreakAttr = hasPageBreak ? ' data-page-break="1"' : '';
+
+                    // 글머리 기호/번호 매기기 접두사 생성
+                    let headingPrefix = '';
+                    let paraStyle = '';
+                    const effectiveParaId = paraClass.replace('para-', '');
+                    const headingInfo = effectiveParaId ? this.headingMap[effectiveParaId] : undefined;
+                    if (headingInfo) {
+                        if (headingInfo.type === 'BULLET' && headingInfo.bulletChar) {
+                            const ch = headingInfo.bulletChar;
+                            const bulletText = ch === '-' ? '- ' : ch + '\u00a0';
+                            if (headingInfo.autoIndent) {
+                                // hanging indent: 글머리 기호 너비만큼 들여쓰기 + 첫 줄 내어쓰기
+                                headingPrefix = `<span style="display:inline;">${bulletText}</span>`;
+                                paraStyle = 'padding-left: 1.5em; text-indent: -1.5em; ';
+                            } else {
+                                headingPrefix = `<span style="display:inline;">${bulletText}</span>`;
+                            }
+                        } else if (headingInfo.type === 'NUMBER') {
+                            const counterKey = `${headingInfo.idRef}-${headingInfo.level}`;
+                            if (!this.numCounters[counterKey]) this.numCounters[counterKey] = 0;
+                            this.numCounters[counterKey]++;
+                            const num = this.numCounters[counterKey];
+                            let numStr = String(num);
+                            switch (headingInfo.numFormat) {
+                                case 'HANGUL_SYLLABLE': {
+                                    const hangul = ['가','나','다','라','마','바','사','아','자','차','카','타','파','하'];
+                                    numStr = hangul[(num - 1) % hangul.length] || String(num);
+                                    break;
+                                }
+                                case 'LATIN_UPPER': numStr = String.fromCharCode(64 + num); break;
+                                case 'LATIN_LOWER': numStr = String.fromCharCode(96 + num); break;
+                                case 'ROMAN_UPPER': case 'ROMAN_LOWER': {
+                                    const roman = ['I','II','III','IV','V','VI','VII','VIII','IX','X'];
+                                    numStr = roman[(num - 1) % roman.length] || String(num);
+                                    if (headingInfo.numFormat === 'ROMAN_LOWER') numStr = numStr.toLowerCase();
+                                    break;
+                                }
+                                case 'CIRCLED_DIGIT': numStr = String.fromCodePoint(0x2460 + num - 1); break;
+                                case 'CIRCLED_HANGUL_SYLLABLE': numStr = String.fromCodePoint(0x3260 + num - 1); break;
+                            }
+                            headingPrefix = `<span style="display:inline;">${numStr}. </span>`;
+                        }
+                    }
+
+                    const paraStyleAttr = paraStyle ? ` style="${paraStyle}"` : '';
                     if (!hasTbl) {
                         const pContentHtml = this.extractRunsFromPara(p, imageMap, false, styleCharClass);
-                        html += `<div class="${paraClass}" data-hwpx="${pPath}">${pContentHtml}</div>`;
+                        html += `<div class="${paraClass}"${pageBreakAttr}${paraStyleAttr} data-hwpx="${pPath}">${headingPrefix}${pContentHtml}</div>`;
                     } else {
                         const textHtml = this.extractRunsFromPara(p, imageMap, true, styleCharClass);
                         if (textHtml.trim()) {
-                            html += `<div class="${paraClass}" data-hwpx="${pPath}">${textHtml}</div>`;
+                            html += `<div class="${paraClass}"${pageBreakAttr}${paraStyleAttr} data-hwpx="${pPath}">${headingPrefix}${textHtml}</div>`;
                         }
                         for (let rri = 0; rri < runs.length; rri++) {
                             if (runs[rri]['hp:tbl']) {
@@ -1673,13 +1802,13 @@ export class HwpxParser {
                         if (binItemIdRef && imageMap[binItemIdRef]) {
                             let imgStyle = '';
 
-                            // 이미지 크기 (curSz) — max-width로 컨테이너 내 제한
-                            const curSz = pic['hp:curSz'];
-                            if (curSz) {
-                                const imgW = parseInt(curSz['@_width'] || '0') / 283.465;
-                                const imgH = parseInt(curSz['@_height'] || '0') / 283.465;
+                            // 이미지 크기 (curSz → sz 순으로 탐색) — max-width로 컨테이너 내 제한
+                            const imgSz = pic['hp:curSz'] || pic['hp:sz'];
+                            if (imgSz) {
+                                const imgW = parseInt(imgSz['@_width'] || '0') / 283.465;
+                                const imgH = parseInt(imgSz['@_height'] || '0') / 283.465;
                                 if (imgW > 0) imgStyle += `width: ${imgW.toFixed(1)}mm; max-width: 100%; `;
-                                if (imgH > 0) imgStyle += `height: auto; `;
+                                if (imgH > 0) imgStyle += `height: ${imgH.toFixed(1)}mm; `;
                             } else {
                                 imgStyle += `max-width: 100%; height: auto; `;
                             }
@@ -1763,13 +1892,13 @@ export class HwpxParser {
                                 if (captionSide === 'TOP') {
                                     html += `<figcaption style="margin-bottom: ${captionGap}mm; ">${captionHtml}</figcaption>`;
                                 }
-                                html += `<img src="${imageMap[binItemIdRef]}" style="${imgStyle}"/>`;
+                                html += this.makeImgTag(imageMap[binItemIdRef], imgStyle);
                                 if (captionSide !== 'TOP') {
                                     html += `<figcaption style="margin-top: ${captionGap}mm; ">${captionHtml}</figcaption>`;
                                 }
                                 html += `</figure>`;
                             } else {
-                                html += `<img src="${imageMap[binItemIdRef]}" style="${posStyle} ${imgStyle}"/>`;
+                                html += this.makeImgTag(imageMap[binItemIdRef], `${posStyle} ${imgStyle}`);
                             }
                         } else {
                             html += `<span style="border:1px dashed #f00; padding:2px;">[이미지 누락: ${binItemIdRef}]</span>`;
@@ -1830,7 +1959,7 @@ export class HwpxParser {
                         if (h > 0) oleStyle += `height: ${h.toFixed(1)}mm; `;
                     }
                     if (binRef && imageMap[binRef]) {
-                        html += `<img src="${imageMap[binRef]}" style="${oleStyle}" alt="OLE 개체"/>`;
+                        html += this.makeImgTag(imageMap[binRef], oleStyle, 'OLE 개체');
                     } else {
                         html += `<span style="border: 1px dashed #999; padding: 4px; ${oleStyle}">[OLE 개체]</span>`;
                     }
@@ -2095,7 +2224,7 @@ export class HwpxParser {
                 if (imgNode) {
                     const binRef = imgNode['@_binaryItemIDRef'] || imgNode['@_binItem'];
                     if (binRef && imageMap[binRef]) {
-                        html += `<img src="${imageMap[binRef]}" style="max-width: 100%; height: auto;"/>`;
+                        html += this.makeImgTag(imageMap[binRef], 'max-width: 100%; height: auto;');
                     }
                 }
             }
@@ -2103,6 +2232,19 @@ export class HwpxParser {
 
         html += `</div>`;
         return html;
+    }
+
+    /**
+     * 이미지 태그 생성 — 큰 base64 data URI는 지연 로딩으로 처리 (Chromium 테이블 파싱 문제 회피)
+     */
+    private static makeImgTag(dataUri: string, style: string, alt: string = ''): string {
+        const DEFERRED_THRESHOLD = 10_000; // 10KB — Chromium 테이블 파싱 문제 방지
+        if (dataUri.length > DEFERRED_THRESHOLD) {
+            const idx = this.deferredImages.length;
+            this.deferredImages.push(dataUri);
+            return `<img data-lazy-idx="${idx}" style="${style}"${alt ? ` alt="${alt}"` : ''}/>`;
+        }
+        return `<img src="${dataUri}" style="${style}"${alt ? ` alt="${alt}"` : ''}/>`;
     }
 
     /**

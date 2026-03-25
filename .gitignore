@@ -1,8 +1,11 @@
 node_modules/
 out/
+out-test/
+dist/
 references/
 .agents/
 .claude/
+.omc/
 prompts/
 *.hwpx
 *.pdf

@@ -61,6 +61,9 @@
 |--------|------|
 | `HWPX: Show API Server Port` | API 서버 주소 표시. "Copy Token" 또는 "Copy URL" 선택 가능 |
 | `HWPX: Copy API Help URL` | API 사용법 문서 URL을 클립보드에 복사. LLM에 바로 전달 가능 |
+| `HWPX: Generate Claude Code Instructions (CLAUDE.md)` | 워크스페이스 루트에 `CLAUDE.md` 생성. API 포트·토큰이 자동 주입됨 |
+| `HWPX: Generate Codex Instructions (AGENTS.md)` | 워크스페이스 루트에 `AGENTS.md` 생성. API 포트·토큰이 자동 주입됨 |
+| `HWPX: Generate Antigravity Instructions (ANTIGRAVITY.md)` | 워크스페이스 루트에 `ANTIGRAVITY.md` 생성. API 포트·토큰이 자동 주입됨 |
 
 ## Rendering Support
 
@@ -126,6 +129,18 @@ curl -X PUT ... -d '{"json": [{"#text": "새 내용"}]}'
 
 ### AI Agent Workflow
 
+**방법 1: 지침 파일 자동 생성 (추천)**
+
+1. VS Code에서 `.hwpx` 파일을 열어 API 서버 활성화
+2. `Ctrl+Shift+P` → 사용하는 도구에 맞는 커맨드 실행:
+   - Claude Code → `HWPX: Generate Claude Code Instructions (CLAUDE.md)`
+   - Codex → `HWPX: Generate Codex Instructions (AGENTS.md)`
+   - Antigravity → `HWPX: Generate Antigravity Instructions (ANTIGRAVITY.md)`
+3. 워크스페이스 루트에 지침 파일이 생성됩니다 (API 포트·토큰 자동 주입)
+4. LLM이 해당 파일을 읽고 바로 API를 사용할 수 있습니다
+
+**방법 2: 수동 전달**
+
 1. 커맨드 팔레트 → `HWPX: Copy API Help URL` → URL을 LLM에 전달
 2. LLM이 `/api/help`를 읽어 API 사용법을 파악
 3. 토큰을 전달 (`HWPX: Show API Server Port` → "Copy Token")
@@ -140,12 +155,12 @@ curl -X PUT ... -d '{"json": [{"#text": "새 내용"}]}'
 > "이번 달 업무실적서에서 '1월'을 모두 '2월'로 바꿔줘"
 
 1. VS Code에서 `.hwpx` 파일을 열면 자동으로 API 서버가 시작됩니다
-2. `Ctrl+Shift+P` → `HWPX: Copy API Help URL` → LLM 채팅에 URL을 붙여넣기
-3. `Ctrl+Shift+P` → `HWPX: Show API Server Port` → "Copy Token" → LLM에 토큰 전달
-4. LLM이 자동으로 API를 호출하여 문서를 탐색하고 수정합니다:
+2. `Ctrl+Shift+P` → 사용 중인 AI 도구에 맞는 지침 파일 생성 커맨드 실행 (예: `HWPX: Generate Claude Code Instructions (CLAUDE.md)`)
+3. 생성된 파일에 API 포트·토큰이 자동 주입되어 있으므로, AI가 바로 사용 가능합니다
+4. AI가 자동으로 API를 호출하여 문서를 탐색하고 수정합니다:
 
 ```bash
-# LLM이 실행하는 명령들 (자동)
+# AI가 실행하는 명령들 (자동 — 포트·토큰은 지침 파일에서 확인)
 # 1. 문서 구조 파악
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/files
 curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/xml?file=Contents/section0.xml"
@@ -179,13 +194,11 @@ curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/save
 
 LLM이 `/api/xml`로 XML을 읽어 구조를 분석하고 답변합니다. 문서를 직접 파싱할 필요 없이 API를 통해 프로그래밍 방식으로 접근할 수 있습니다.
 
-### 시나리오 4: Claude Code / Cursor 등 AI IDE에서 직접 사용
-
-AI 코딩 도구에서 터미널을 통해 curl 명령을 직접 실행할 수 있으므로, HWPX 문서 수정을 코딩 워크플로우에 통합할 수 있습니다:
+### 시나리오 4: Claude Code / Codex / Antigravity 등 AI IDE에서 직접 사용
 
 1. VS Code에서 `.hwpx` 파일을 열어둔 상태로
-2. AI IDE에 `/api/help` URL과 토큰을 알려주면
-3. AI가 자율적으로 문서를 탐색, 수정, 저장합니다
+2. `Ctrl+Shift+P` → `HWPX: Generate Claude Code Instructions (CLAUDE.md)` (또는 Codex/Antigravity용) 실행
+3. 워크스페이스에 생성된 지침 파일에 API 포트·토큰이 포함되어 있으므로, AI가 바로 문서를 탐색·수정·저장합니다
 
 ### Security
 - 서버는 `127.0.0.1`에만 바인딩 (외부 접근 불가)

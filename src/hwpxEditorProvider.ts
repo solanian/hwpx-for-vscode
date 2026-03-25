@@ -350,7 +350,9 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     <button id="tb-underline" title="밑줄 (Ctrl+U)" style="text-decoration:underline;">U</button>
                     <button id="tb-strike" title="취소선"><s>S</s></button>
                     <div class="tb-sep"></div>
+                    <button id="tb-fontsize-down" title="글꼴 축소" style="font-size:11px;width:22px;">A−</button>
                     <input type="number" id="tb-fontsize" title="글꼴 크기 (pt)" min="6" max="200" value="12" step="1">
+                    <button id="tb-fontsize-up" title="글꼴 확대" style="font-size:14px;width:22px;">A+</button>
                     <div class="tb-sep"></div>
                     <div class="tb-color-wrap">
                         <span class="tb-color-label">A</span>
@@ -366,6 +368,8 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     <button id="tb-align-right" title="오른쪽 정렬" style="font-size:11px;">&#9776;</button>
                     <button id="tb-align-justify" title="양쪽 정렬" style="font-size:11px;">&#9776;</button>
                     <div class="tb-sep"></div>
+                    <button id="tb-ul" title="글머리 기호 (- )">—</button>
+                    <div class="tb-sep"></div>
                     <button id="tb-remove-format" title="서식 제거" style="font-size:12px;">T<span style="font-size:9px;">x</span></button>
                 </div>
                 <div id="hwpx-zoom-indicator">
@@ -375,6 +379,7 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                 </div>
                 <script>
                 (function() {
+                    try {
                     var vscodeApi = acquireVsCodeApi();
                     var zoomLevel = 100;
                     var MIN_ZOOM = 25;
@@ -571,22 +576,75 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     document.getElementById('tb-strike').addEventListener('click', function() { execCmd('strikeThrough'); updateToolbarState(); });
 
                     var fontSizeInput = document.getElementById('tb-fontsize');
-                    fontSizeInput.addEventListener('change', function() {
+                    var savedSelection = null;
+                    var skipToolbarUpdate = false;
+
+                    function saveCurrentSelection() {
                         var sel = window.getSelection();
-                        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-                        var size = fontSizeInput.value;
-                        var range = sel.getRangeAt(0);
-                        var span = document.createElement('span');
-                        span.style.fontSize = size + 'pt';
-                        try {
-                            range.surroundContents(span);
-                            sel.removeAllRanges();
-                            var nr = document.createRange();
-                            nr.selectNodeContents(span);
-                            sel.addRange(nr);
-                        } catch(e) {
-                            execCmd('fontSize', '3');
+                        if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+                            savedSelection = sel.getRangeAt(0).cloneRange();
                         }
+                    }
+                    fontSizeInput.addEventListener('mousedown', saveCurrentSelection);
+                    fontSizeInput.addEventListener('focus', saveCurrentSelection);
+                    document.getElementById('tb-fontsize-down').addEventListener('mousedown', function(e) { saveCurrentSelection(); e.preventDefault(); });
+                    document.getElementById('tb-fontsize-up').addEventListener('mousedown', function(e) { saveCurrentSelection(); e.preventDefault(); });
+
+                    function applyFontSize(size) {
+                        var range = savedSelection;
+                        if (!range || range.collapsed) return;
+                        skipToolbarUpdate = true;
+                        var sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        // Use execCommand fontSize then fix the generated font tags
+                        execCmd('fontSize', '7');
+                        var fontTags = document.querySelectorAll('font[size=\"7\"]');
+                        var lastSpan = null;
+                        var firstSpan = null;
+                        for (var fi = 0; fi < fontTags.length; fi++) {
+                            var span = document.createElement('span');
+                            span.style.fontSize = size + 'pt';
+                            while (fontTags[fi].firstChild) {
+                                span.appendChild(fontTags[fi].firstChild);
+                            }
+                            fontTags[fi].parentNode.replaceChild(span, fontTags[fi]);
+                            if (!firstSpan) firstSpan = span;
+                            lastSpan = span;
+                        }
+                        // Re-select the applied spans so user can continue clicking
+                        if (firstSpan && lastSpan) {
+                            var newRange = document.createRange();
+                            newRange.setStartBefore(firstSpan.firstChild || firstSpan);
+                            newRange.setEndAfter(lastSpan.lastChild || lastSpan);
+                            sel.removeAllRanges();
+                            sel.addRange(newRange);
+                            savedSelection = newRange.cloneRange();
+                        }
+                        fontSizeInput.value = size;
+                        setTimeout(function() { skipToolbarUpdate = false; }, 100);
+                    }
+
+                    fontSizeInput.addEventListener('change', function() {
+                        applyFontSize(parseInt(fontSizeInput.value) || 12);
+                    });
+                    fontSizeInput.addEventListener('keydown', function(e) {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            applyFontSize(parseInt(fontSizeInput.value) || 12);
+                        }
+                    });
+                    document.getElementById('tb-fontsize-down').addEventListener('click', function() {
+                        var cur = parseInt(fontSizeInput.value) || 12;
+                        var next = Math.max(6, cur - 1);
+                        fontSizeInput.value = next;
+                        applyFontSize(next);
+                    });
+                    document.getElementById('tb-fontsize-up').addEventListener('click', function() {
+                        var cur = parseInt(fontSizeInput.value) || 12;
+                        var next = Math.min(200, cur + 1);
+                        fontSizeInput.value = next;
+                        applyFontSize(next);
                     });
 
                     document.getElementById('tb-forecolor').addEventListener('input', function(e) { execCmd('foreColor', e.target.value); });
@@ -597,9 +655,56 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     document.getElementById('tb-align-right').addEventListener('click', function() { execCmd('justifyRight'); updateToolbarState(); });
                     document.getElementById('tb-align-justify').addEventListener('click', function() { execCmd('justifyFull'); updateToolbarState(); });
 
+                    // Toggle "- " prefix on current cursor line within a text node (matches HWPX document style)
+                    function toggleBulletPrefix() {
+                        var sel = window.getSelection();
+                        if (!sel || sel.rangeCount === 0) return;
+                        var node = sel.anchorNode;
+                        var offset = sel.anchorOffset;
+                        // Find the text node the cursor is in
+                        if (!node) return;
+                        if (node.nodeType === 1) {
+                            // If cursor is on an element, try to get its text child
+                            if (node.childNodes.length > 0 && offset < node.childNodes.length) {
+                                node = node.childNodes[offset];
+                                offset = 0;
+                            }
+                            if (node.nodeType !== 3) {
+                                // Walk to first text node
+                                var tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+                                node = tw.nextNode();
+                                if (!node) return;
+                                offset = 0;
+                            }
+                        }
+                        var text = node.textContent;
+                        // Find the start of the current line (search backwards for newline)
+                        var lineStart = text.lastIndexOf('\\n', offset - 1) + 1;
+                        // Find the end of the current line
+                        var lineEnd = text.indexOf('\\n', offset);
+                        if (lineEnd === -1) lineEnd = text.length;
+                        var line = text.substring(lineStart, lineEnd);
+                        var prefix = '- ';
+                        if (line.substring(0, 2) === prefix) {
+                            // Remove prefix
+                            node.textContent = text.substring(0, lineStart) + line.substring(2) + text.substring(lineEnd);
+                            // Restore cursor position
+                            var newOffset = Math.max(lineStart, offset - 2);
+                            sel.collapse(node, newOffset);
+                        } else {
+                            // Add prefix
+                            node.textContent = text.substring(0, lineStart) + prefix + line + text.substring(lineEnd);
+                            sel.collapse(node, offset + 2);
+                        }
+                    }
+                    document.getElementById('tb-ul').addEventListener('click', function() {
+                        toggleBulletPrefix();
+                    });
+
                     document.getElementById('tb-remove-format').addEventListener('click', function() { execCmd('removeFormat'); updateToolbarState(); });
 
                     function updateToolbarState() {
+                        if (skipToolbarUpdate) return;
                         document.getElementById('tb-bold').classList.toggle('active', document.queryCommandState('bold'));
                         document.getElementById('tb-italic').classList.toggle('active', document.queryCommandState('italic'));
                         document.getElementById('tb-underline').classList.toggle('active', document.queryCommandState('underline'));
@@ -609,6 +714,7 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                         document.getElementById('tb-align-right').classList.toggle('active', document.queryCommandState('justifyRight'));
                         document.getElementById('tb-align-justify').classList.toggle('active', document.queryCommandState('justifyFull'));
                         var sel = window.getSelection();
+                        // Font size display
                         if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
                             var node = sel.anchorNode;
                             if (node && node.nodeType === 3) node = node.parentElement;
@@ -618,6 +724,19 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                                 if (px) fontSizeInput.value = Math.round(px * 0.75);
                             }
                         }
+                        // Bullet active state: check if current line starts with "- "
+                        var bulletActive = false;
+                        if (sel && sel.rangeCount > 0) {
+                            var bNode = sel.anchorNode;
+                            var bOffset = sel.anchorOffset;
+                            if (bNode && bNode.nodeType === 3) {
+                                var bText = bNode.textContent || '';
+                                var bLineStart = bText.lastIndexOf('\\n', bOffset - 1) + 1;
+                                var bLine = bText.substring(bLineStart);
+                                bulletActive = bLine.substring(0, 2) === '- ';
+                            }
+                        }
+                        document.getElementById('tb-ul').classList.toggle('active', bulletActive);
                     }
 
                     document.addEventListener('selectionchange', function() {
@@ -654,6 +773,9 @@ export class HwpxEditorProvider implements vscode.CustomReadonlyEditorProvider {
                             scrollContainer.classList.remove('dragging');
                         }
                     });
+                } catch(initErr) {
+                    console.error('HWPX Viewer init error:', initErr);
+                }
                 })();
                 </script>`;
     }
